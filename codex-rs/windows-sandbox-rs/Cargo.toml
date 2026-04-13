@@ -17,6 +17,10 @@ path = "src/bin/setup_main.rs"
 name = "codex-command-runner"
 path = "src/bin/command_runner.rs"
 
+[[bin]]
+name = "codex-windows-sandbox-host"
+path = "src/bin/sandbox_host.rs"
+
 [lints]
 workspace = true
 
