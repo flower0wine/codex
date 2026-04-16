@@ -15,6 +15,9 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 Examples:
 
 ```powershell
+.\codex-windows-sandbox-host.exe --backend auto --policy workspace-write -- cmd /c "echo HOST_OK"
+.\codex-windows-sandbox-host.exe --backend unelevated --policy workspace-write -- cmd /c "echo HOST_OK"
+.\codex-windows-sandbox-host.exe --backend elevated --policy workspace-write -- cmd /c "echo HOST_OK"
 .\codex-windows-sandbox-host.exe --policy workspace-write -- cmd /c "echo HOST_OK"
 .\codex-windows-sandbox-host.exe --clear-env --env PATH=C:\Windows\System32 -- cmd /c ver
 .\codex-windows-sandbox-host.exe --policy-cwd C:\work --policy "{\"type\":\"read-only\"}" -- powershell -NoProfile -Command Get-ChildItem
@@ -33,6 +36,16 @@ Examples:
   - Rejected values:
     - `danger-full-access`
     - `external-sandbox`
+- `--backend <auto|elevated|unelevated>`
+  - Default: `auto`
+  - `elevated`: force elevated setup/runner path.
+  - `unelevated`: force restricted-token path (no UAC setup flow).
+  - `auto` selection:
+    1. Use `elevated` when `--proxy-enforced` is set.
+    2. Use `elevated` when `--read-root` or `--write-root` is provided.
+    3. Use `elevated` when policy requires restricted read access.
+    4. Otherwise use `elevated` only if sandbox setup marker already exists.
+    5. Fall back to `unelevated` when setup is not complete.
 - `--policy-cwd <PATH>`
   - Base directory for policy-relative interpretation.
   - Default: `--cwd` value.
@@ -53,12 +66,15 @@ Examples:
   - Requests private desktop mode for elevated path.
 - `--proxy-enforced`
   - Forces offline sandbox identity path used by setup/network policy.
+  - Supported only by `elevated` backend.
 - `--read-root <PATH>` (repeatable)
   - Optional override list for readable roots.
   - If at least one `--read-root` is provided, computed defaults are replaced by this list.
+  - Supported only by `elevated` backend.
 - `--write-root <PATH>` (repeatable)
   - Optional override list for writable roots.
   - If at least one `--write-root` is provided, computed defaults are replaced by this list.
+  - Supported only by `elevated` backend.
 - `--deny-write-path <PATH>` (repeatable)
   - Optional explicit deny-write subpaths.
 - `--env <KEY=VALUE>` (repeatable)

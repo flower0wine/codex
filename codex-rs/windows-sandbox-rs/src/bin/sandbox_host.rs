@@ -1,13 +1,24 @@
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use codex_windows_sandbox::ElevatedSandboxCaptureRequest;
+    use codex_windows_sandbox::parse_policy;
     use codex_windows_sandbox::run_windows_sandbox_capture_elevated;
+    use codex_windows_sandbox::run_windows_sandbox_capture_with_extra_deny_write_paths;
+    use codex_windows_sandbox::sandbox_setup_is_complete;
     use std::collections::HashMap;
     use std::io::Write;
     use std::path::PathBuf;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Backend {
+        Auto,
+        Elevated,
+        Unelevated,
+    }
+
     let mut args = std::env::args().skip(1);
     let mut policy = String::from("read-only");
+    let mut backend = Backend::Auto;
     let mut policy_cwd: Option<PathBuf> = None;
     let mut cwd: Option<PathBuf> = None;
     let mut codex_home: Option<PathBuf> = None;
@@ -27,6 +38,9 @@ Usage:
   codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 
 Examples:
+  codex-windows-sandbox-host --backend auto --policy workspace-write -- cmd /c \"echo HOST_OK\"
+  codex-windows-sandbox-host --backend unelevated --policy workspace-write -- cmd /c \"echo HOST_OK\"
+  codex-windows-sandbox-host --backend elevated --policy workspace-write -- cmd /c \"echo HOST_OK\"
   codex-windows-sandbox-host --policy workspace-write -- cmd /c \"echo HOST_OK\"
   codex-windows-sandbox-host --clear-env --env PATH=C:\\Windows\\System32 -- cmd /c ver
   codex-windows-sandbox-host --policy-cwd C:\\work --policy \"{\\\"type\\\":\\\"read-only\\\"}\" -- powershell -NoProfile -Command Get-ChildItem
@@ -41,6 +55,16 @@ Options:
       Notes:
       - danger-full-access and external-sandbox are rejected.
       - JSON is parsed exactly as codex_protocol::protocol::SandboxPolicy.
+
+  --backend <auto|elevated|unelevated>
+      Select Windows sandbox backend.
+      Default: auto.
+      auto selection rules:
+      - Use elevated when --proxy-enforced is set.
+      - Use elevated when --read-root or --write-root is provided.
+      - Use elevated when policy requires restricted read access.
+      - Otherwise use elevated only if sandbox setup marker already exists.
+      - Fallback to unelevated when setup is not complete.
 
   --policy-cwd <PATH>
       Base directory used when resolving policy-relative paths.
@@ -68,14 +92,17 @@ Options:
   --proxy-enforced
       Force offline network identity path during setup/refresh, even if policy
       requests full network access.
+      Supported only by elevated backend.
 
   --read-root <PATH>      (repeatable)
       Override computed readable roots with an explicit root list.
       When present at least once, only the provided values are used.
+      Supported only by elevated backend.
 
   --write-root <PATH>     (repeatable)
       Override computed writable roots with an explicit root list.
       When present at least once, only the provided values are used.
+      Supported only by elevated backend.
 
   --deny-write-path <PATH> (repeatable)
       Add explicit deny-write paths that remain read-only even under
@@ -109,6 +136,21 @@ Argument parsing notes:
                 policy = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("missing value for --policy"))?;
+            }
+            "--backend" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --backend"))?;
+                backend = match value.as_str() {
+                    "auto" => Backend::Auto,
+                    "elevated" => Backend::Elevated,
+                    "unelevated" => Backend::Unelevated,
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "invalid --backend: {value}. Expected auto|elevated|unelevated"
+                        ));
+                    }
+                };
             }
             "--policy-cwd" => {
                 policy_cwd =
@@ -203,20 +245,65 @@ Argument parsing notes:
         Some(write_roots.as_slice())
     };
 
-    let capture = run_windows_sandbox_capture_elevated(ElevatedSandboxCaptureRequest {
-        policy_json_or_preset: policy.as_str(),
-        sandbox_policy_cwd: policy_cwd.as_path(),
-        codex_home: codex_home.as_path(),
-        command,
-        cwd: cwd.as_path(),
-        env_map,
-        timeout_ms,
-        use_private_desktop,
-        proxy_enforced,
-        read_roots_override,
-        write_roots_override,
-        deny_write_paths_override: deny_write_paths.as_slice(),
-    })?;
+    let resolved_backend = match backend {
+        Backend::Elevated => Backend::Elevated,
+        Backend::Unelevated => Backend::Unelevated,
+        Backend::Auto => {
+            let parsed_policy = parse_policy(policy.as_str())?;
+            if proxy_enforced
+                || read_roots_override.is_some()
+                || write_roots_override.is_some()
+                || !parsed_policy.has_full_disk_read_access()
+            {
+                Backend::Elevated
+            } else if sandbox_setup_is_complete(codex_home.as_path()) {
+                Backend::Elevated
+            } else {
+                Backend::Unelevated
+            }
+        }
+    };
+
+    let capture = match resolved_backend {
+        Backend::Elevated => run_windows_sandbox_capture_elevated(ElevatedSandboxCaptureRequest {
+            policy_json_or_preset: policy.as_str(),
+            sandbox_policy_cwd: policy_cwd.as_path(),
+            codex_home: codex_home.as_path(),
+            command,
+            cwd: cwd.as_path(),
+            env_map,
+            timeout_ms,
+            use_private_desktop,
+            proxy_enforced,
+            read_roots_override,
+            write_roots_override,
+            deny_write_paths_override: deny_write_paths.as_slice(),
+        })?,
+        Backend::Unelevated => {
+            if proxy_enforced {
+                return Err(anyhow::anyhow!(
+                    "--proxy-enforced is only supported with --backend elevated (or auto)"
+                ));
+            }
+            if read_roots_override.is_some() || write_roots_override.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--read-root/--write-root overrides are only supported with --backend elevated (or auto)"
+                ));
+            }
+            run_windows_sandbox_capture_with_extra_deny_write_paths(
+                policy.as_str(),
+                policy_cwd.as_path(),
+                codex_home.as_path(),
+                command,
+                cwd.as_path(),
+                env_map,
+                timeout_ms,
+                deny_write_paths.as_slice(),
+                use_private_desktop,
+            )?
+        }
+        Backend::Auto => unreachable!("backend auto must be resolved before execution"),
+    };
 
     if !capture.stdout.is_empty() {
         std::io::stdout().write_all(&capture.stdout)?;

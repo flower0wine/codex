@@ -15,6 +15,9 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 1. 工作区可写策略：
 
 ```powershell
+.\codex-windows-sandbox-host.exe --backend auto --policy workspace-write -- cmd /c "echo HOST_OK"
+.\codex-windows-sandbox-host.exe --backend unelevated --policy workspace-write -- cmd /c "echo HOST_OK"
+.\codex-windows-sandbox-host.exe --backend elevated --policy workspace-write -- cmd /c "echo HOST_OK"
 .\codex-windows-sandbox-host.exe --policy workspace-write -- cmd /c "echo HOST_OK"
 ```
 
@@ -48,6 +51,19 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
   - `danger-full-access`
   - `external-sandbox`
 
+`--backend <auto|elevated|unelevated>`
+
+- 选择 Windows 沙盒后端。
+- 默认值：`auto`。
+- `elevated`：强制走管理员 setup/runner 路径。
+- `unelevated`：强制走非管理员 restricted-token 路径。
+- `auto` 选择规则：
+  1. 传了 `--proxy-enforced` 时使用 `elevated`；
+  2. 传了 `--read-root` 或 `--write-root` 时使用 `elevated`；
+  3. 策略需要受限读权限时使用 `elevated`；
+  4. 其他情况下，若已存在 setup marker 则使用 `elevated`；
+  5. 若 setup 未完成则回退到 `unelevated`。
+
 `--policy-cwd <PATH>`
 
 - 作为策略中相对路径解析的基准目录。
@@ -80,16 +96,19 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 
 - 即使策略声明允许网络，也强制走 offline network identity 路径。
 - 会影响 setup/refresh 期间选择的身份与离线代理相关设置。
+- 仅 `elevated` 后端支持。
 
 `--read-root <PATH>`（可重复）
 
 - 显式覆盖“可读根目录”列表。
 - 只要出现至少一次，就不再使用默认计算结果。
+- 仅 `elevated` 后端支持。
 
 `--write-root <PATH>`（可重复）
 
 - 显式覆盖“可写根目录”列表。
 - 只要出现至少一次，就不再使用默认计算结果。
+- 仅 `elevated` 后端支持。
 
 `--deny-write-path <PATH>`（可重复）
 
