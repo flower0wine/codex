@@ -12,20 +12,27 @@ It wraps `run_windows_sandbox_capture_elevated(...)` and prints child
 codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 ```
 
-Example:
+Examples:
 
 ```powershell
 .\codex-windows-sandbox-host.exe --policy workspace-write -- cmd /c "echo HOST_OK"
+.\codex-windows-sandbox-host.exe --clear-env --env PATH=C:\Windows\System32 -- cmd /c ver
+.\codex-windows-sandbox-host.exe --policy-cwd C:\work --policy "{\"type\":\"read-only\"}" -- powershell -NoProfile -Command Get-ChildItem
 ```
 
 ## Options
 
+- `-h`, `--help`
+  - Print full help text.
 - `--policy <VALUE>`
   - Default: `read-only`
   - Accepted values:
     - `read-only`
     - `workspace-write`
     - JSON object matching `SandboxPolicy` (see below)
+  - Rejected values:
+    - `danger-full-access`
+    - `external-sandbox`
 - `--policy-cwd <PATH>`
   - Base directory for policy-relative interpretation.
   - Default: `--cwd` value.
@@ -41,27 +48,38 @@ Example:
     4. `<cwd>\.codex`
 - `--timeout-ms <U64>`
   - Optional timeout in milliseconds.
+  - If timeout happens, host prints `sandbox command timed out` and exits with `192`.
 - `--private-desktop`
   - Requests private desktop mode for elevated path.
 - `--proxy-enforced`
   - Forces offline sandbox identity path used by setup/network policy.
 - `--read-root <PATH>` (repeatable)
   - Optional override list for readable roots.
+  - If at least one `--read-root` is provided, computed defaults are replaced by this list.
 - `--write-root <PATH>` (repeatable)
   - Optional override list for writable roots.
+  - If at least one `--write-root` is provided, computed defaults are replaced by this list.
 - `--deny-write-path <PATH>` (repeatable)
   - Optional explicit deny-write subpaths.
 - `--env <KEY=VALUE>` (repeatable)
   - Add/override child environment variable.
 - `--clear-env`
   - Start from empty env map before applying `--env`.
+  - Option ordering matters. If `--clear-env` appears after `--env`, earlier `--env` values are cleared too.
+
+## Argument parsing rules
+
+- All sandbox-host options must appear before `--`.
+- Everything after `--` is treated as command + command args.
+- Unknown options fail fast.
+- Omitting command causes:
+  - `missing command. Use -- <COMMAND> [ARGS...]`
 
 ## Exit code and output
 
 - Child process `stdout/stderr` are streamed to the host process outputs.
 - Host exits with child exit code.
-- If timeout occurs, the child is terminated and host exits with timeout code
-  behavior from capture path.
+- If timeout occurs, the child is terminated and host exits with `192`.
 
 ## `SandboxPolicy` JSON examples
 

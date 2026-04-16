@@ -20,6 +20,81 @@ fn main() -> anyhow::Result<()> {
     let mut env_map: HashMap<String, String> = std::env::vars().collect();
     let mut command: Vec<String> = Vec::new();
 
+    const HELP_TEXT: &str = "\
+codex-windows-sandbox-host - run a command through Windows sandbox setup + runner
+
+Usage:
+  codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
+
+Examples:
+  codex-windows-sandbox-host --policy workspace-write -- cmd /c \"echo HOST_OK\"
+  codex-windows-sandbox-host --clear-env --env PATH=C:\\Windows\\System32 -- cmd /c ver
+  codex-windows-sandbox-host --policy-cwd C:\\work --policy \"{\\\"type\\\":\\\"read-only\\\"}\" -- powershell -NoProfile -Command Get-ChildItem
+
+Options:
+  -h, --help
+      Show this help text.
+
+  --policy <read-only|workspace-write|JSON>
+      Sandbox policy preset or raw SandboxPolicy JSON.
+      Default: read-only.
+      Notes:
+      - danger-full-access and external-sandbox are rejected.
+      - JSON is parsed exactly as codex_protocol::protocol::SandboxPolicy.
+
+  --policy-cwd <PATH>
+      Base directory used when resolving policy-relative paths.
+      Default: value of --cwd (or current process directory if --cwd is not set).
+
+  --cwd <PATH>
+      Working directory of the child command inside the sandbox session.
+      Default: current process directory.
+
+  --codex-home <PATH>
+      Base directory that stores sandbox runtime artifacts.
+      Default resolution order:
+      1) --codex-home
+      2) CODEX_HOME
+      3) %USERPROFILE%\\.codex
+      4) <cwd>\\.codex
+
+  --timeout-ms <U64>
+      Optional timeout in milliseconds. If exceeded, child is terminated.
+      Host prints \"sandbox command timed out\" and exits with code 192.
+
+  --private-desktop
+      Request private desktop mode for TTY/conpty launches.
+
+  --proxy-enforced
+      Force offline network identity path during setup/refresh, even if policy
+      requests full network access.
+
+  --read-root <PATH>      (repeatable)
+      Override computed readable roots with an explicit root list.
+      When present at least once, only the provided values are used.
+
+  --write-root <PATH>     (repeatable)
+      Override computed writable roots with an explicit root list.
+      When present at least once, only the provided values are used.
+
+  --deny-write-path <PATH> (repeatable)
+      Add explicit deny-write paths that remain read-only even under
+      workspace-write configurations.
+
+  --env <KEY=VALUE>       (repeatable)
+      Set or override one environment variable for the child process.
+      By default, the current process environment is inherited first.
+
+  --clear-env
+      Clear inherited environment before applying any --env pairs.
+      Option ordering matters: later --clear-env clears earlier --env values.
+
+Argument parsing notes:
+  - All sandbox-host options must appear before \"--\".
+  - Everything after \"--\" is treated as command + command args.
+  - Unknown options fail fast.
+";
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--" => {
@@ -27,22 +102,7 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             "-h" | "--help" => {
-                println!(
-                    "Usage: codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]\n\n\
-                     Options:\n\
-                     --policy <read-only|workspace-write|JSON>\n\
-                     --policy-cwd <PATH>\n\
-                     --cwd <PATH>\n\
-                     --codex-home <PATH>\n\
-                     --timeout-ms <U64>\n\
-                     --private-desktop\n\
-                     --proxy-enforced\n\
-                     --read-root <PATH> (repeatable)\n\
-                     --write-root <PATH> (repeatable)\n\
-                     --deny-write-path <PATH> (repeatable)\n\
-                     --env <KEY=VALUE> (repeatable)\n\
-                     --clear-env"
-                );
+                println!("{HELP_TEXT}");
                 return Ok(());
             }
             "--policy" => {

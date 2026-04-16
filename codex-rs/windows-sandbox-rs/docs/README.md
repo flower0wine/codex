@@ -60,3 +60,4 @@ Runtime state will be created under `CODEX_HOME` (or its default):
 - `internal-binaries.md`: behavior and wire contracts for setup/runner helpers
 - `rust-api.md`: Rust API integration (`run_windows_sandbox_capture_elevated`)
 - `packaging.md`: reproducible build/package/validation steps for distribution
+- `zh-CN/README.md`: 中文文档导航（`sandbox-host` 使用、参数与策略说明、排障）
