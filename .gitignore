@@ -93,3 +93,5 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
+*.exe
+.codex-sandbox-*/

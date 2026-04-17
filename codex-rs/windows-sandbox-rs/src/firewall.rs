@@ -317,14 +317,16 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
                     format!("SetRemoteAddresses failed: {err:?}"),
                 ))
             })?;
-        let remote_ports = spec.remote_ports.unwrap_or("*");
-        rule.SetRemotePorts(&BSTR::from(remote_ports))
-            .map_err(|err| {
-                anyhow::Error::new(SetupFailure::new(
-                    SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                    format!("SetRemotePorts failed: {err:?}"),
-                ))
-            })?;
+        if protocol_supports_remote_ports(spec.protocol) {
+            let remote_ports = spec.remote_ports.unwrap_or("*");
+            rule.SetRemotePorts(&BSTR::from(remote_ports))
+                .map_err(|err| {
+                    anyhow::Error::new(SetupFailure::new(
+                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                        format!("SetRemotePorts failed: {err:?}"),
+                    ))
+                })?;
+        }
         rule.SetLocalUserAuthorizedList(&BSTR::from(spec.local_user_spec))
             .map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
@@ -352,6 +354,10 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn protocol_supports_remote_ports(protocol: i32) -> bool {
+    protocol == NET_FW_IP_PROTOCOL_TCP.0 || protocol == NET_FW_IP_PROTOCOL_UDP.0
 }
 
 fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String> {
@@ -404,6 +410,13 @@ fn log_line(log: &mut File, msg: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_ports_supported_only_for_tcp_udp() {
+        assert!(protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_TCP.0));
+        assert!(protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_UDP.0));
+        assert!(!protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_ANY.0));
+    }
 
     #[test]
     fn configured_remote_address_literals_are_accepted_by_firewall_com() {
