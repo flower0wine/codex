@@ -23,9 +23,11 @@ use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAddMember
 use windows_sys::Win32::NetworkManagement::NetManagement::NetUserAdd;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetUserSetInfo;
 use windows_sys::Win32::NetworkManagement::NetManagement::UF_DONT_EXPIRE_PASSWD;
+use windows_sys::Win32::NetworkManagement::NetManagement::UF_LOCKOUT;
 use windows_sys::Win32::NetworkManagement::NetManagement::UF_SCRIPT;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1003;
+use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1008;
 use windows_sys::Win32::NetworkManagement::NetManagement::USER_PRIV_USER;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::CopySid;
@@ -131,6 +133,28 @@ pub fn ensure_local_user(name: &str, password: &str, log: &mut File) -> Result<(
                 return Err(anyhow::Error::new(SetupFailure::new(
                     SetupErrorCode::HelperUserCreateOrUpdateFailed,
                     format!("failed to create/update user {name}, code {status}/{upd}"),
+                )));
+            }
+            let flags_info = USER_INFO_1008 {
+                usri1008_flags: (UF_SCRIPT | UF_DONT_EXPIRE_PASSWD) & !UF_LOCKOUT,
+            };
+            let flags_upd = NetUserSetInfo(
+                std::ptr::null(),
+                name_w.as_ptr(),
+                1008,
+                &flags_info as *const _ as *mut u8,
+                std::ptr::null_mut(),
+            );
+            if flags_upd != NERR_Success {
+                super::log_line(
+                    log,
+                    &format!("NetUserSetInfo flags failed for {name} code {flags_upd}"),
+                )?;
+                return Err(anyhow::Error::new(SetupFailure::new(
+                    SetupErrorCode::HelperUserCreateOrUpdateFailed,
+                    format!(
+                        "failed to clear lockout for user {name}, code {status}/{upd}/{flags_upd}"
+                    ),
                 )));
             }
         }
