@@ -65,6 +65,10 @@ function addResult(results, name, required, pass, runResult, note = '') {
   });
 }
 
+function psSingleQuoted(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
 const results = [];
 
 const baseArgs = ['--cwd', ws, '--codex-home', codexHome];
@@ -268,6 +272,102 @@ addResult(
   true,
   r.code === 0 && r.stdout.includes('PRIVATE_DESKTOP_OK'),
   r
+);
+
+const networkProbe = [
+  "$ProgressPreference = 'SilentlyContinue'",
+  'try {',
+  "  $response = Invoke-WebRequest -Uri 'https://www.example.com/' -UseBasicParsing -TimeoutSec 8",
+  '  if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {',
+  "    Write-Output 'NETWORK_OK'",
+  '    exit 0',
+  '  }',
+  "  Write-Output ('NETWORK_STATUS_' + $response.StatusCode)",
+  '  exit 2',
+  '} catch {',
+  '  Write-Error $_',
+  '  exit 1',
+  '}',
+].join('; ');
+r = runHost([
+  '--policy',
+  'workspace-write',
+  ...baseArgs,
+  '--timeout-ms',
+  '15000',
+  '--',
+  'powershell',
+  '-NoLogo',
+  '-NoProfile',
+  '-Command',
+  networkProbe,
+]);
+addResult(
+  results,
+  'diagnostic_network_reachable',
+  false,
+  r.code === 0 && r.stdout.includes('NETWORK_OK'),
+  r,
+  'Diagnostic only: pass means outbound HTTPS was reachable from inside the sandbox'
+);
+
+const outsideScript = join(outside, 'outside_script.ps1');
+fs.writeFileSync(outsideScript, "Write-Output 'OUTSIDE_SCRIPT_OK'\n", 'utf8');
+r = runHost([
+  '--policy',
+  'workspace-write',
+  ...baseArgs,
+  '--',
+  'powershell',
+  '-NoLogo',
+  '-NoProfile',
+  '-ExecutionPolicy',
+  'Bypass',
+  '-File',
+  outsideScript,
+]);
+addResult(
+  results,
+  'diagnostic_execute_script_outside_cwd',
+  false,
+  r.code === 0 && r.stdout.includes('OUTSIDE_SCRIPT_OK'),
+  r,
+  'Diagnostic only: pass means a script located outside the workspace CWD was executable'
+);
+
+const outsideFromScriptFile = join(outside, 'outside_from_workspace_script.txt');
+const workspaceWriterScript = join(ws, 'write_outside.ps1');
+fs.rmSync(outsideFromScriptFile, { force: true });
+fs.writeFileSync(
+  workspaceWriterScript,
+  [
+    "$ErrorActionPreference = 'Stop'",
+    `$path = ${psSingleQuoted(outsideFromScriptFile)}`,
+    "Set-Content -LiteralPath $path -Value 'OUTSIDE_WRITE_OK'",
+    "Write-Output 'WORKSPACE_SCRIPT_OUTSIDE_WRITE_OK'",
+  ].join('\n') + '\n',
+  'utf8'
+);
+r = runHost([
+  '--policy',
+  'workspace-write',
+  ...baseArgs,
+  '--',
+  'powershell',
+  '-NoLogo',
+  '-NoProfile',
+  '-ExecutionPolicy',
+  'Bypass',
+  '-File',
+  workspaceWriterScript,
+]);
+addResult(
+  results,
+  'diagnostic_workspace_script_writes_outside_cwd',
+  false,
+  r.code === 0 && fs.existsSync(outsideFromScriptFile),
+  r,
+  'Diagnostic only: pass means a workspace script was able to create a file outside the workspace CWD'
 );
 
 r = runHost([
