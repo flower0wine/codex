@@ -52,6 +52,7 @@ yarn-error.log*
 # env
 .env*
 !.env.example
+.venv/
 
 # package
 *.tgz
@@ -92,6 +93,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-
-*.exe
-.codex-sandbox-*/

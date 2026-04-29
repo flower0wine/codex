@@ -1,6 +1,7 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
@@ -8,14 +9,17 @@ use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_rollout::state_db::StateDbHandle;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::error;
 
 type PendingInterruptQueue = Vec<(
@@ -25,16 +29,29 @@ type PendingInterruptQueue = Vec<(
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
-    pub(crate) rollout_path: PathBuf,
+    pub(crate) history_items: Vec<RolloutItem>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
-    pub(crate) instruction_sources: Vec<PathBuf>,
+    pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
+    pub(crate) emit_thread_goal_update: bool,
+    pub(crate) thread_goal_state_db: Option<StateDbHandle>,
+    pub(crate) include_turns: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
 pub(crate) enum ThreadListenerCommand {
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
     SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
+    // EmitThreadGoalUpdated is used to order app-server goal updates with running-thread resume responses.
+    EmitThreadGoalUpdated {
+        goal: ThreadGoal,
+    },
+    // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
+    EmitThreadGoalCleared,
+    // EmitThreadGoalSnapshot is used to read and emit the latest goal state in the listener order.
+    EmitThreadGoalSnapshot {
+        state_db: StateDbHandle,
+    },
     // ResolveServerRequest is used to notify the client that the request has been resolved.
     // It is executed in the thread listener's context to ensure that the resolved notification is ordered with regard to the request itself.
     ResolveServerRequest {
@@ -57,6 +74,7 @@ pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
+    pub(crate) last_terminal_turn_id: Option<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
@@ -111,7 +129,7 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
-    pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
+    pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
@@ -119,6 +137,7 @@ impl ThreadState {
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
+            self.last_terminal_turn_id = Some(event_turn_id.to_string());
             self.current_turn_history.reset();
         }
     }
@@ -159,6 +178,7 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
+    has_connections_watcher: watch::Sender<bool>,
 }
 
 impl Default for ThreadEntry {
@@ -166,7 +186,18 @@ impl Default for ThreadEntry {
         Self {
             state: Arc::new(Mutex::new(ThreadState::default())),
             connection_ids: HashSet::new(),
+            has_connections_watcher: watch::channel(false).0,
         }
+    }
+}
+
+impl ThreadEntry {
+    fn update_has_connections(&self) {
+        let _ = self.has_connections_watcher.send_if_modified(|current| {
+            let prev = *current;
+            *current = !self.connection_ids.is_empty();
+            prev != *current
+        });
     }
 }
 
@@ -286,12 +317,14 @@ impl ThreadStateManager {
             }
             if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
                 thread_entry.connection_ids.remove(&connection_id);
+                thread_entry.update_has_connections();
             }
         };
 
         true
     }
 
+    #[cfg(test)]
     pub(crate) async fn has_subscribers(&self, thread_id: ThreadId) -> bool {
         self.state
             .lock()
@@ -319,6 +352,7 @@ impl ThreadStateManager {
                 .insert(thread_id);
             let thread_entry = state.threads.entry(thread_id).or_default();
             thread_entry.connection_ids.insert(connection_id);
+            thread_entry.update_has_connections();
             thread_entry.state.clone()
         };
         {
@@ -344,12 +378,9 @@ impl ThreadStateManager {
             .entry(connection_id)
             .or_default()
             .insert(thread_id);
-        state
-            .threads
-            .entry(thread_id)
-            .or_default()
-            .connection_ids
-            .insert(connection_id);
+        let thread_entry = state.threads.entry(thread_id).or_default();
+        thread_entry.connection_ids.insert(connection_id);
+        thread_entry.update_has_connections();
         true
     }
 
@@ -364,6 +395,7 @@ impl ThreadStateManager {
             for thread_id in &thread_ids {
                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
                     thread_entry.connection_ids.remove(&connection_id);
+                    thread_entry.update_has_connections();
                 }
             }
             thread_ids
@@ -376,5 +408,16 @@ impl ThreadStateManager {
                 })
                 .collect::<Vec<_>>()
         }
+    }
+
+    pub(crate) async fn subscribe_to_has_connections(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<watch::Receiver<bool>> {
+        let state = self.state.lock().await;
+        state
+            .threads
+            .get(&thread_id)
+            .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
     }
 }

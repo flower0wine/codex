@@ -4,8 +4,6 @@
 //! between user and agent.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fmt;
 use std::ops::Mul;
 use std::path::Path;
@@ -38,8 +36,10 @@ use crate::message_history::HistoryEntry;
 use crate::models::BaseInstructions;
 use crate::models::ContentItem;
 use crate::models::MessagePhase;
+use crate::models::PermissionProfile;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
+use crate::models::SandboxEnforcement;
 use crate::models::WebSearchAction;
 use crate::num_format::format_with_separators;
 use crate::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -49,7 +49,6 @@ use crate::request_permissions::RequestPermissionsEvent;
 use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
 use crate::user_input::UserInput;
-use codex_git_utils::GitSha;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -67,6 +66,7 @@ pub use crate::approvals::ExecPolicyAmendment;
 pub use crate::approvals::GuardianAssessmentAction;
 pub use crate::approvals::GuardianAssessmentDecisionSource;
 pub use crate::approvals::GuardianAssessmentEvent;
+pub use crate::approvals::GuardianAssessmentOutcome;
 pub use crate::approvals::GuardianAssessmentStatus;
 pub use crate::approvals::GuardianCommandSource;
 pub use crate::approvals::GuardianRiskLevel;
@@ -82,6 +82,7 @@ pub use crate::permissions::FileSystemSandboxKind;
 pub use crate::permissions::FileSystemSandboxPolicy;
 pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
 
@@ -102,6 +103,23 @@ pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+pub struct TurnEnvironmentSelection {
+    pub environment_id: String,
+    pub cwd: AbsolutePathBuf,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct GitSha(pub String);
+
+impl GitSha {
+    pub fn new(sha: &str) -> Self {
+        Self(sha.to_string())
+    }
+}
 
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -134,6 +152,8 @@ pub struct McpServerRefreshConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ConversationStartParams {
+    /// Selects whether the realtime session should produce text or audio output.
+    pub output_modality: RealtimeOutputModality,
     #[serde(
         default,
         deserialize_with = "conversation_start_prompt_serde::deserialize",
@@ -155,6 +175,13 @@ pub struct ConversationStartParams {
 pub enum ConversationStartTransport {
     Websocket,
     Webrtc { sdp: String },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeOutputModality {
+    Text,
+    Audio,
 }
 
 mod conversation_start_prompt_serde {
@@ -291,6 +318,11 @@ pub struct RealtimeTranscriptDelta {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeTranscriptDone {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RealtimeTranscriptEntry {
     pub role: String,
     pub text: String,
@@ -302,6 +334,12 @@ pub struct RealtimeHandoffRequested {
     pub item_id: String,
     pub input_transcript: String,
     pub active_transcript: Vec<RealtimeTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeNoopRequested {
+    pub call_id: String,
+    pub item_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -332,7 +370,9 @@ pub enum RealtimeEvent {
     },
     InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted),
     InputTranscriptDelta(RealtimeTranscriptDelta),
+    InputTranscriptDone(RealtimeTranscriptDone),
     OutputTranscriptDelta(RealtimeTranscriptDelta),
+    OutputTranscriptDone(RealtimeTranscriptDone),
     AudioOut(RealtimeAudioFrame),
     ResponseCreated(RealtimeResponseCreated),
     ResponseCancelled(RealtimeResponseCancelled),
@@ -342,6 +382,7 @@ pub enum RealtimeEvent {
         item_id: String,
     },
     HandoffRequested(RealtimeHandoffRequested),
+    NoopRequested(RealtimeNoopRequested),
     Error(String),
 }
 
@@ -391,12 +432,88 @@ pub enum Op {
     UserInput {
         /// User input items, see `InputItem`
         items: Vec<UserInput>,
+        /// Optional turn-scoped environments.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environments: Option<Vec<TurnEnvironmentSelection>>,
         /// Optional JSON Schema used to constrain the final assistant message for this turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         final_output_json_schema: Option<Value>,
         /// Optional turn-scoped Responses API `client_metadata`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         responsesapi_client_metadata: Option<HashMap<String, String>>,
+    },
+
+    /// Similar to [`Op::UserInput`], but first applies persistent turn-context
+    /// overrides in the same queued operation. This preserves submission order
+    /// and prevents the input from starting if the overrides are rejected.
+    UserInputWithTurnContext {
+        /// User input items, see `InputItem`
+        items: Vec<UserInput>,
+        /// Optional turn-scoped environment selections.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environments: Option<Vec<TurnEnvironmentSelection>>,
+        /// Optional JSON Schema used to constrain the final assistant message for this turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        final_output_json_schema: Option<Value>,
+        /// Optional turn-scoped Responses API `client_metadata`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+
+        /// Updated `cwd` for sandbox/tool calls.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+
+        /// Updated command approval policy.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<AskForApproval>,
+
+        /// Updated approval reviewer for future approval prompts.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approvals_reviewer: Option<ApprovalsReviewer>,
+
+        /// Updated sandbox policy for tool calls.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox_policy: Option<SandboxPolicy>,
+
+        /// Updated permissions profile for tool calls.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_profile: Option<PermissionProfile>,
+
+        /// Updated Windows sandbox mode for tool execution.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        windows_sandbox_level: Option<WindowsSandboxLevel>,
+
+        /// Updated model slug. When set, the model info is derived
+        /// automatically.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+
+        /// Updated reasoning effort (honored only for reasoning-capable models).
+        ///
+        /// Use `Some(Some(_))` to set a specific effort, `Some(None)` to clear
+        /// the effort, or `None` to leave the existing value unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<Option<ReasoningEffortConfig>>,
+
+        /// Updated reasoning summary preference (honored only for reasoning-capable models).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<ReasoningSummaryConfig>,
+
+        /// Updated service tier preference for future turns.
+        ///
+        /// Use `Some(Some(_))` to set a specific tier, `Some(None)` to clear the
+        /// preference, or `None` to leave the existing value unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        service_tier: Option<Option<ServiceTier>>,
+
+        /// EXPERIMENTAL - set a pre-set collaboration mode.
+        /// Takes precedence over model, effort, and developer instructions if set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collaboration_mode: Option<CollaborationMode>,
+
+        /// Updated personality preference.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        personality: Option<Personality>,
     },
 
     /// Similar to [`Op::UserInput`], but contains additional context required
@@ -419,6 +536,13 @@ pub enum Op {
 
         /// Policy to use for tool calls such as `local_shell`.
         sandbox_policy: SandboxPolicy,
+
+        /// Full permissions profile to use for tool calls such as `local_shell`.
+        ///
+        /// When omitted, `sandbox_policy` is used as a legacy compatibility
+        /// projection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_profile: Option<PermissionProfile>,
 
         /// Must be a valid model slug for the configured client session
         /// associated with this conversation.
@@ -454,6 +578,10 @@ pub enum Op {
         /// Optional personality override for this turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         personality: Option<Personality>,
+
+        /// Optional turn-scoped environments.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environments: Option<Vec<TurnEnvironmentSelection>>,
     },
 
     /// Inter-agent communication that should be recorded as assistant history
@@ -484,6 +612,10 @@ pub enum Op {
         /// Updated sandbox policy for tool calls.
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox_policy: Option<SandboxPolicy>,
+
+        /// Updated permissions profile for tool calls.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_profile: Option<PermissionProfile>,
 
         /// Updated Windows sandbox mode for tool execution.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -625,18 +757,21 @@ pub enum Op {
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
 
-    /// Drop all persisted memory artifacts and memory-tracking DB rows.
-    DropMemories,
-
-    /// Trigger a single pass of the startup memory pipeline.
-    UpdateMemories,
-
     /// Set a user-facing thread name in the persisted rollout metadata.
     /// This is a local-only operation handled by codex-core; it does not
     /// involve the model.
     SetThreadName { name: String },
 
-    /// Request Codex to undo a turn (turn are stacked so it is the same effect as CMD + Z).
+    /// Set whether the thread remains eligible for memory generation.
+    ///
+    /// This persists thread-level memory mode metadata without involving the
+    /// model.
+    SetThreadMemoryMode { mode: ThreadMemoryMode },
+
+    /// Legacy request to undo a turn.
+    ///
+    /// The op is still accepted for compatibility, but ghost snapshots are no
+    /// longer produced so the request reports unavailable.
     Undo,
 
     /// Request Codex to drop the last N user turns from in-memory context.
@@ -647,6 +782,9 @@ pub enum Op {
 
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
+
+    /// Record that the user approved one retry of a concrete Guardian-denied action.
+    ApproveGuardianDeniedAction { event: GuardianAssessmentEvent },
 
     /// Request to shut down codex instance.
     Shutdown,
@@ -665,9 +803,17 @@ pub enum Op {
     ListModels,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadMemoryMode {
+    Enabled,
+    Disabled,
+}
+
 impl From<Vec<UserInput>> for Op {
     fn from(value: Vec<UserInput>) -> Self {
         Op::UserInput {
+            environments: None,
             items: value,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
@@ -708,6 +854,7 @@ impl InterAgentCommunication {
             content: vec![ContentItem::OutputText {
                 text: serde_json::to_string(self).unwrap_or_default(),
             }],
+            phase: Some(MessagePhase::Commentary),
         }
     }
 
@@ -736,6 +883,7 @@ impl Op {
             Self::RealtimeConversationClose => "realtime_conversation_close",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::UserInput { .. } => "user_input",
+            Self::UserInputWithTurnContext { .. } => "user_input_with_turn_context",
             Self::UserTurn { .. } => "user_turn",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::OverrideTurnContext { .. } => "override_turn_context",
@@ -752,12 +900,12 @@ impl Op {
             Self::ReloadUserConfig => "reload_user_config",
             Self::ListSkills { .. } => "list_skills",
             Self::Compact => "compact",
-            Self::DropMemories => "drop_memories",
-            Self::UpdateMemories => "update_memories",
             Self::SetThreadName { .. } => "set_thread_name",
+            Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
             Self::Undo => "undo",
             Self::ThreadRollback { .. } => "thread_rollback",
             Self::Review { .. } => "review",
+            Self::ApproveGuardianDeniedAction { .. } => "approve_guardian_denied_action",
             Self::Shutdown => "shutdown",
             Self::RunUserShellCommand { .. } => "run_user_shell_command",
             Self::ListModels => "list_models",
@@ -872,76 +1020,6 @@ impl NetworkAccess {
         matches!(self, NetworkAccess::Enabled)
     }
 }
-fn default_include_platform_defaults() -> bool {
-    true
-}
-
-/// Determines how read-only file access is granted inside a restricted
-/// sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Default, JsonSchema, TS)]
-#[strum(serialize_all = "kebab-case")]
-#[serde(tag = "type", rename_all = "kebab-case")]
-#[ts(tag = "type")]
-pub enum ReadOnlyAccess {
-    /// Restrict reads to an explicit set of roots.
-    ///
-    /// When `include_platform_defaults` is `true`, platform defaults required
-    /// for basic execution are included in addition to `readable_roots`.
-    Restricted {
-        /// Include built-in platform read roots required for basic process
-        /// execution.
-        #[serde(default = "default_include_platform_defaults")]
-        include_platform_defaults: bool,
-        /// Additional absolute roots that should be readable.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        readable_roots: Vec<AbsolutePathBuf>,
-    },
-
-    /// Allow unrestricted file reads.
-    #[default]
-    FullAccess,
-}
-
-impl ReadOnlyAccess {
-    pub fn has_full_disk_read_access(&self) -> bool {
-        matches!(self, ReadOnlyAccess::FullAccess)
-    }
-
-    /// Returns true if platform defaults should be included for restricted read access.
-    pub fn include_platform_defaults(&self) -> bool {
-        matches!(
-            self,
-            ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                ..
-            }
-        )
-    }
-
-    /// Returns the readable roots for restricted read access.
-    ///
-    /// For [`ReadOnlyAccess::FullAccess`], returns an empty list because
-    /// callers should grant blanket read access instead.
-    pub fn get_readable_roots_with_cwd(&self, cwd: &Path) -> Vec<AbsolutePathBuf> {
-        let mut roots: Vec<AbsolutePathBuf> = match self {
-            ReadOnlyAccess::FullAccess => return Vec::new(),
-            ReadOnlyAccess::Restricted { readable_roots, .. } => {
-                let mut roots = readable_roots.clone();
-                match AbsolutePathBuf::from_absolute_path(cwd) {
-                    Ok(cwd_root) => roots.push(cwd_root),
-                    Err(err) => {
-                        error!("Ignoring invalid cwd {cwd:?} for sandbox readable root: {err}");
-                    }
-                }
-                roots
-            }
-        };
-
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.to_path_buf()));
-        roots
-    }
-}
 
 /// Determines execution restrictions for model shell commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, JsonSchema, TS)]
@@ -955,13 +1033,6 @@ pub enum SandboxPolicy {
     /// Read-only access configuration.
     #[serde(rename = "read-only")]
     ReadOnly {
-        /// Read access granted while running under this policy.
-        #[serde(
-            default,
-            skip_serializing_if = "ReadOnlyAccess::has_full_disk_read_access"
-        )]
-        access: ReadOnlyAccess,
-
         /// When set to `true`, outbound network access is allowed. `false` by
         /// default.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -985,13 +1056,6 @@ pub enum SandboxPolicy {
         /// writable from within the sandbox.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         writable_roots: Vec<AbsolutePathBuf>,
-
-        /// Read access granted while running under this policy.
-        #[serde(
-            default,
-            skip_serializing_if = "ReadOnlyAccess::has_full_disk_read_access"
-        )]
-        read_only_access: ReadOnlyAccess,
 
         /// When set to `true`, outbound network access is allowed. `false` by
         /// default.
@@ -1022,6 +1086,11 @@ pub struct WritableRoot {
 
     /// By construction, these subpaths are all under `root`.
     pub read_only_subpaths: Vec<AbsolutePathBuf>,
+
+    /// Workspace metadata path names that must not be created or replaced under
+    /// `root` unless the policy grants an explicit write rule for that metadata
+    /// path.
+    pub protected_metadata_names: Vec<String>,
 }
 
 impl WritableRoot {
@@ -1038,7 +1107,25 @@ impl WritableRoot {
             }
         }
 
+        if self.path_contains_protected_metadata_name(path) {
+            return false;
+        }
+
         true
+    }
+
+    fn path_contains_protected_metadata_name(&self, path: &Path) -> bool {
+        let Ok(relative_path) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+
+        let Some(first_component) = relative_path.components().next() else {
+            return false;
+        };
+
+        self.protected_metadata_names
+            .iter()
+            .any(|name| first_component.as_os_str() == std::ffi::OsStr::new(name))
     }
 }
 
@@ -1070,7 +1157,6 @@ impl SandboxPolicy {
     /// Returns a policy with read-only disk access and no network.
     pub fn new_read_only_policy() -> Self {
         SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::FullAccess,
             network_access: false,
         }
     }
@@ -1081,7 +1167,6 @@ impl SandboxPolicy {
     pub fn new_workspace_write_policy() -> Self {
         SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::FullAccess,
             network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
@@ -1089,14 +1174,7 @@ impl SandboxPolicy {
     }
 
     pub fn has_full_disk_read_access(&self) -> bool {
-        match self {
-            SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly { access, .. } => access.has_full_disk_read_access(),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => read_only_access.has_full_disk_read_access(),
-        }
+        true
     }
 
     pub fn has_full_disk_write_access(&self) -> bool {
@@ -1117,46 +1195,6 @@ impl SandboxPolicy {
         }
     }
 
-    /// Returns true if platform defaults should be included for restricted read access.
-    pub fn include_platform_defaults(&self) -> bool {
-        if self.has_full_disk_read_access() {
-            return false;
-        }
-        match self {
-            SandboxPolicy::ReadOnly { access, .. } => access.include_platform_defaults(),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => read_only_access.include_platform_defaults(),
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => false,
-        }
-    }
-
-    /// Returns the list of readable roots (tailored to the current working
-    /// directory) when read access is restricted.
-    ///
-    /// For policies with full read access, this returns an empty list because
-    /// callers should grant blanket reads.
-    pub fn get_readable_roots_with_cwd(&self, cwd: &Path) -> Vec<AbsolutePathBuf> {
-        let mut roots = match self {
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => Vec::new(),
-            SandboxPolicy::ReadOnly { access, .. } => access.get_readable_roots_with_cwd(cwd),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => {
-                let mut roots = read_only_access.get_readable_roots_with_cwd(cwd);
-                roots.extend(
-                    self.get_writable_roots_with_cwd(cwd)
-                        .into_iter()
-                        .map(|root| root.root),
-                );
-                roots
-            }
-        };
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.to_path_buf()));
-        roots
-    }
-
     /// Returns the list of writable roots (tailored to the current working
     /// directory) together with subpaths that should remain read‑only under
     /// each writable root.
@@ -1167,7 +1205,6 @@ impl SandboxPolicy {
             SandboxPolicy::ReadOnly { .. } => Vec::new(),
             SandboxPolicy::WorkspaceWrite {
                 writable_roots,
-                read_only_access: _,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
                 network_access: _,
@@ -1193,11 +1230,15 @@ impl SandboxPolicy {
 
                 // Include /tmp on Unix unless explicitly excluded.
                 if cfg!(unix) && !exclude_slash_tmp {
-                    #[allow(clippy::expect_used)]
-                    let slash_tmp =
-                        AbsolutePathBuf::from_absolute_path("/tmp").expect("/tmp is absolute");
-                    if slash_tmp.as_path().is_dir() {
-                        roots.push(slash_tmp);
+                    match AbsolutePathBuf::from_absolute_path("/tmp") {
+                        Ok(slash_tmp) => {
+                            if slash_tmp.as_path().is_dir() {
+                                roots.push(slash_tmp);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Ignoring invalid /tmp for sandbox writable root: {e}");
+                        }
                     }
                 }
 
@@ -1238,6 +1279,7 @@ impl SandboxPolicy {
                                 &writable_root,
                                 protect_missing_dot_codex,
                             ),
+                            protected_metadata_names: Vec::new(),
                             root: writable_root,
                         }
                     })
@@ -1245,107 +1287,6 @@ impl SandboxPolicy {
             }
         }
     }
-}
-
-fn default_read_only_subpaths_for_writable_root(
-    writable_root: &AbsolutePathBuf,
-    protect_missing_dot_codex: bool,
-) -> Vec<AbsolutePathBuf> {
-    let mut subpaths: Vec<AbsolutePathBuf> = Vec::new();
-    let top_level_git = writable_root.join(".git");
-    // This applies to typical repos (directory .git), worktrees/submodules
-    // (file .git with gitdir pointer), and bare repos when the gitdir is the
-    // writable root itself.
-    let top_level_git_is_file = top_level_git.as_path().is_file();
-    let top_level_git_is_dir = top_level_git.as_path().is_dir();
-    if top_level_git_is_dir || top_level_git_is_file {
-        if top_level_git_is_file
-            && is_git_pointer_file(&top_level_git)
-            && let Some(gitdir) = resolve_gitdir_from_file(&top_level_git)
-        {
-            subpaths.push(gitdir);
-        }
-        subpaths.push(top_level_git);
-    }
-
-    let top_level_agents = writable_root.join(".agents");
-    if top_level_agents.as_path().is_dir() {
-        subpaths.push(top_level_agents);
-    }
-
-    // Keep top-level project metadata under .codex read-only to the agent by
-    // default. For the workspace root itself, protect it even before the
-    // directory exists so first-time creation still goes through the
-    // protected-path approval flow.
-    let top_level_codex = writable_root.join(".codex");
-    if protect_missing_dot_codex || top_level_codex.as_path().is_dir() {
-        subpaths.push(top_level_codex);
-    }
-
-    let mut deduped = Vec::with_capacity(subpaths.len());
-    let mut seen = HashSet::new();
-    for path in subpaths {
-        if seen.insert(path.to_path_buf()) {
-            deduped.push(path);
-        }
-    }
-    deduped
-}
-
-fn is_git_pointer_file(path: &AbsolutePathBuf) -> bool {
-    path.as_path().is_file() && path.as_path().file_name() == Some(OsStr::new(".git"))
-}
-
-fn resolve_gitdir_from_file(dot_git: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
-    let contents = match std::fs::read_to_string(dot_git.as_path()) {
-        Ok(contents) => contents,
-        Err(err) => {
-            error!(
-                "Failed to read {path} for gitdir pointer: {err}",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-
-    let trimmed = contents.trim();
-    let (_, gitdir_raw) = match trimmed.split_once(':') {
-        Some(parts) => parts,
-        None => {
-            error!(
-                "Expected {path} to contain a gitdir pointer, but it did not match `gitdir: <path>`.",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-    let gitdir_raw = gitdir_raw.trim();
-    if gitdir_raw.is_empty() {
-        error!(
-            "Expected {path} to contain a gitdir pointer, but it was empty.",
-            path = dot_git.as_path().display()
-        );
-        return None;
-    }
-    let base = match dot_git.as_path().parent() {
-        Some(base) => base,
-        None => {
-            error!(
-                "Unable to resolve parent directory for {path}.",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-    let gitdir_path = AbsolutePathBuf::resolve_path_against_base(gitdir_raw, base);
-    if !gitdir_path.as_path().exists() {
-        error!(
-            "Resolved gitdir path {path} does not exist.",
-            path = gitdir_path.as_path().display()
-        );
-        return None;
-    }
-    Some(gitdir_path)
 }
 
 /// Event Queue Entry - events from agent
@@ -1371,6 +1312,9 @@ pub enum EventMsg {
     /// indicates the turn continued but the user should still be notified.
     Warning(WarningEvent),
 
+    /// Warning issued by the guardian automatic approval reviewer.
+    GuardianWarning(WarningEvent),
+
     /// Realtime conversation lifecycle start event.
     RealtimeConversationStarted(RealtimeConversationStartedEvent),
 
@@ -1385,6 +1329,9 @@ pub enum EventMsg {
 
     /// Model routing changed from the requested model to a different model.
     ModelReroute(ModelRerouteEvent),
+
+    /// Backend recommends additional account verification for this turn.
+    ModelVerification(ModelVerificationEvent),
 
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
@@ -1434,6 +1381,9 @@ pub enum EventMsg {
 
     /// Updated session metadata (e.g., thread name changes).
     ThreadNameUpdated(ThreadNameUpdatedEvent),
+
+    /// Updated long-running goal metadata for the thread.
+    ThreadGoalUpdated(ThreadGoalUpdatedEvent),
 
     /// Incremental MCP startup progress updates.
     McpStartupUpdate(McpStartupUpdateEvent),
@@ -1501,6 +1451,9 @@ pub enum EventMsg {
     /// Notification that the agent is about to apply a code patch. Mirrors
     /// `ExecCommandBegin` so front‑ends can show progress indicators.
     PatchApplyBegin(PatchApplyBeginEvent),
+
+    /// Latest model-generated structured changes for an `apply_patch` call.
+    PatchApplyUpdated(PatchApplyUpdatedEvent),
 
     /// Notification that a patch application has finished.
     PatchApplyEnd(PatchApplyEndEvent),
@@ -1573,6 +1526,7 @@ pub enum EventMsg {
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
     PreToolUse,
+    PermissionRequest,
     PostToolUse,
     SessionStart,
     UserPromptSubmit,
@@ -1599,6 +1553,21 @@ pub enum HookExecutionMode {
 pub enum HookScope {
     Thread,
     Turn,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookSource {
+    System,
+    User,
+    Project,
+    Mdm,
+    SessionFlags,
+    Plugin,
+    LegacyManagedConfigFile,
+    LegacyManagedConfigMdm,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1636,7 +1605,9 @@ pub struct HookRunSummary {
     pub handler_type: HookHandlerType,
     pub execution_mode: HookExecutionMode,
     pub scope: HookScope,
-    pub source_path: PathBuf,
+    pub source_path: AbsolutePathBuf,
+    #[serde(default)]
+    pub source: HookSource,
     pub display_order: i64,
     pub status: HookRunStatus,
     pub status_message: Option<String>,
@@ -1792,6 +1763,7 @@ pub enum CodexErrorInfo {
     ContextWindowExceeded,
     UsageLimitExceeded,
     ServerOverloaded,
+    CyberPolicy,
     HttpConnectionFailed {
         http_status_code: Option<u16>,
     },
@@ -1828,6 +1800,7 @@ impl CodexErrorInfo {
             Self::ContextWindowExceeded
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
+            | Self::CyberPolicy
             | Self::HttpConnectionFailed { .. }
             | Self::ResponseStreamConnectionFailed { .. }
             | Self::InternalServerError
@@ -2011,6 +1984,18 @@ pub struct ModelRerouteEvent {
     pub reason: ModelRerouteReason,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ModelVerification {
+    TrustedAccessForCyber,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ModelVerificationEvent {
+    pub verifications: Vec<ModelVerification>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
 
@@ -2026,6 +2011,10 @@ pub struct TurnCompleteEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub duration_ms: Option<i64>,
+    /// Duration between turn start and the first model token in milliseconds, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub time_to_first_token_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -2136,6 +2125,18 @@ pub struct RateLimitSnapshot {
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub plan_type: Option<crate::account::PlanType>,
+    pub rate_limit_reached_type: Option<RateLimitReachedType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum RateLimitReachedType {
+    RateLimitReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
@@ -2332,6 +2333,9 @@ pub struct McpToolCallBeginEvent {
     /// Identifier so this can be paired with the McpToolCallEnd event.
     pub call_id: String,
     pub invocation: McpInvocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_resource_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
@@ -2339,6 +2343,9 @@ pub struct McpToolCallEndEvent {
     /// Identifier for the corresponding McpToolCallBegin that finished.
     pub call_id: String,
     pub invocation: McpInvocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_resource_uri: Option<String>,
     #[ts(type = "string")]
     pub duration: Duration,
     /// Result of the tool call. Note this could be an error.
@@ -2351,6 +2358,9 @@ pub struct DynamicToolCallResponseEvent {
     pub call_id: String,
     /// Turn ID that this dynamic tool call belongs to.
     pub turn_id: String,
+    /// Dynamic tool namespace, when one was provided.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Dynamic tool name.
     pub tool: String,
     /// Dynamic tool call arguments.
@@ -2402,7 +2412,7 @@ pub struct ImageGenerationEndEvent {
     pub result: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub saved_path: Option<String>,
+    pub saved_path: Option<AbsolutePathBuf>,
 }
 
 // Conversation kept for backward compatibility.
@@ -2418,7 +2428,7 @@ pub struct ConversationPathResponseEvent {
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Vec<RolloutItem>,
-    pub rollout_path: PathBuf,
+    pub rollout_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -2430,6 +2440,14 @@ pub enum InitialHistory {
 }
 
 impl InitialHistory {
+    pub fn scan_rollout_items(&self, mut predicate: impl FnMut(&RolloutItem) -> bool) -> bool {
+        match self {
+            InitialHistory::New | InitialHistory::Cleared => false,
+            InitialHistory::Resumed(resumed) => resumed.history.iter().any(&mut predicate),
+            InitialHistory::Forked(items) => items.iter().any(predicate),
+        }
+    }
+
     pub fn forked_from_id(&self) -> Option<ThreadId> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
@@ -2538,9 +2556,17 @@ pub enum SessionSource {
     Exec,
     Mcp,
     Custom(String),
+    Internal(InternalSessionSource),
     SubAgent(SubAgentSource),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum InternalSessionSource {
+    MemoryConsolidation,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2571,6 +2597,7 @@ impl fmt::Display for SessionSource {
             SessionSource::Exec => f.write_str("exec"),
             SessionSource::Mcp => f.write_str("mcp"),
             SessionSource::Custom(source) => f.write_str(source),
+            SessionSource::Internal(source) => write!(f, "internal_{source}"),
             SessionSource::SubAgent(sub_source) => write!(f, "subagent_{sub_source}"),
             SessionSource::Unknown => f.write_str("unknown"),
         }
@@ -2595,13 +2622,31 @@ impl SessionSource {
         })
     }
 
+    /// Low cardinality thread source label for analytics.
+    pub fn thread_source_name(&self) -> Option<&'static str> {
+        match self {
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec => Some("user"),
+            SessionSource::Internal(_) => Some("internal"),
+            SessionSource::SubAgent(_) => Some("subagent"),
+            SessionSource::Mcp | SessionSource::Custom(_) | SessionSource::Unknown => None,
+        }
+    }
+
+    pub fn is_internal(&self) -> bool {
+        matches!(self, SessionSource::Internal(_))
+    }
+
+    pub fn is_non_root_agent(&self) -> bool {
+        matches!(
+            self,
+            SessionSource::Internal(_) | SessionSource::SubAgent(_)
+        )
+    }
+
     pub fn get_nickname(&self) -> Option<String> {
         match self {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_nickname, .. }) => {
                 agent_nickname.clone()
-            }
-            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
-                Some("Morpheus".to_string())
             }
             _ => None,
         }
@@ -2611,9 +2656,6 @@ impl SessionSource {
         match self {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
                 agent_role.clone()
-            }
-            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
-                Some("memory builder".to_string())
             }
             _ => None,
         }
@@ -2636,7 +2678,7 @@ impl SessionSource {
             | SessionSource::Exec
             | SessionSource::Mcp
             | SessionSource::Unknown => Some(Product::Codex),
-            SessionSource::SubAgent(_) => None,
+            SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
         }
     }
 
@@ -2662,6 +2704,14 @@ impl fmt::Display for SubAgentSource {
                 write!(f, "thread_spawn_{parent_thread_id}_d{depth}")
             }
             SubAgentSource::Other(other) => f.write_str(other),
+        }
+    }
+}
+
+impl fmt::Display for InternalSessionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
         }
     }
 }
@@ -2756,7 +2806,6 @@ impl From<CompactedItem> for ResponseItem {
             content: vec![ContentItem::OutputText {
                 text: value.message,
             }],
-            end_turn: None,
             phase: None,
         }
     }
@@ -2785,8 +2834,12 @@ pub struct TurnContextItem {
     pub timezone: Option<String>,
     pub approval_policy: AskForApproval,
     pub sandbox_policy: SandboxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<PermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<TurnContextNetworkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_sandbox_policy: Option<FileSystemSandboxPolicy>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
@@ -2805,6 +2858,25 @@ pub struct TurnContextItem {
     pub final_output_json_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation_policy: Option<TruncationPolicy>,
+}
+
+impl TurnContextItem {
+    pub fn permission_profile(&self) -> PermissionProfile {
+        self.permission_profile.clone().unwrap_or_else(|| {
+            let file_system_sandbox_policy =
+                self.file_system_sandbox_policy.clone().unwrap_or_else(|| {
+                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                        &self.sandbox_policy,
+                        &self.cwd,
+                    )
+                });
+            PermissionProfile::from_runtime_permissions_with_enforcement(
+                SandboxEnforcement::from_legacy_sandbox_policy(&self.sandbox_policy),
+                &file_system_sandbox_policy,
+                NetworkSandboxPolicy::from(&self.sandbox_policy),
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2999,7 +3071,7 @@ pub struct ExecCommandBeginEvent {
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory if not the default cwd for the agent.
-    pub cwd: PathBuf,
+    pub cwd: AbsolutePathBuf,
     pub parsed_cmd: Vec<ParsedCommand>,
     /// Where the command originated. Defaults to Agent for backward compatibility.
     #[serde(default)]
@@ -3023,7 +3095,7 @@ pub struct ExecCommandEndEvent {
     /// The command that was executed.
     pub command: Vec<String>,
     /// The command's working directory if not the default cwd for the agent.
-    pub cwd: PathBuf,
+    pub cwd: AbsolutePathBuf,
     pub parsed_cmd: Vec<ParsedCommand>,
     /// Where the command originated. Defaults to Agent for backward compatibility.
     #[serde(default)]
@@ -3056,7 +3128,7 @@ pub struct ViewImageToolCallEvent {
     /// Identifier for the originating tool call.
     pub call_id: String,
     /// Local filesystem path provided to the tool.
-    pub path: PathBuf,
+    pub path: AbsolutePathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3152,6 +3224,14 @@ pub struct PatchApplyBeginEvent {
     /// If true, there was no ApplyPatchApprovalRequest for this patch.
     pub auto_approved: bool,
     /// The changes to be applied.
+    pub changes: HashMap<PathBuf, FileChange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct PatchApplyUpdatedEvent {
+    /// Identifier for the originating `apply_patch` tool call.
+    pub call_id: String,
+    /// Structured file changes parsed from the model-generated patch input so far.
     pub changes: HashMap<PathBuf, FileChange>,
 }
 
@@ -3332,7 +3412,7 @@ pub struct SkillMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub dependencies: Option<SkillDependencies>,
-    pub path: PathBuf,
+    pub path: AbsolutePathBuf,
     pub scope: SkillScope,
     pub enabled: bool,
 }
@@ -3344,9 +3424,9 @@ pub struct SkillInterface {
     #[ts(optional)]
     pub short_description: Option<String>,
     #[ts(optional)]
-    pub icon_small: Option<PathBuf>,
+    pub icon_small: Option<AbsolutePathBuf>,
     #[ts(optional)]
-    pub icon_large: Option<PathBuf>,
+    pub icon_large: Option<AbsolutePathBuf>,
     #[ts(optional)]
     pub brand_color: Option<String>,
     #[ts(optional)]
@@ -3397,7 +3477,7 @@ pub struct SessionNetworkProxyRuntime {
     pub socks_addr: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Serialize, JsonSchema, TS)]
 pub struct SessionConfiguredEvent {
     pub session_id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3425,12 +3505,12 @@ pub struct SessionConfiguredEvent {
     #[serde(default)]
     pub approvals_reviewer: ApprovalsReviewer,
 
-    /// How to sandbox commands executed in the system
-    pub sandbox_policy: SandboxPolicy,
+    /// Canonical effective permissions for commands executed in the session.
+    pub permission_profile: PermissionProfile,
 
     /// Working directory that should be treated as the *root* of the
     /// session.
-    pub cwd: PathBuf,
+    pub cwd: AbsolutePathBuf,
 
     /// The effort the model is putting into reasoning about the user's request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3457,12 +3537,127 @@ pub struct SessionConfiguredEvent {
     pub rollout_path: Option<PathBuf>,
 }
 
+impl<'de> Deserialize<'de> for SessionConfiguredEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            session_id: ThreadId,
+            forked_from_id: Option<ThreadId>,
+            #[serde(default)]
+            thread_name: Option<String>,
+            model: String,
+            model_provider_id: String,
+            service_tier: Option<ServiceTier>,
+            approval_policy: AskForApproval,
+            #[serde(default)]
+            approvals_reviewer: ApprovalsReviewer,
+            // `SessionConfiguredEvent` is persisted into rollout history. Older
+            // rollouts only have `sandbox_policy`, so accept it on deserialize
+            // and immediately project it into the canonical `permission_profile`.
+            sandbox_policy: Option<SandboxPolicy>,
+            permission_profile: Option<PermissionProfile>,
+            cwd: AbsolutePathBuf,
+            reasoning_effort: Option<ReasoningEffortConfig>,
+            history_log_id: u64,
+            history_entry_count: usize,
+            initial_messages: Option<Vec<EventMsg>>,
+            network_proxy: Option<SessionNetworkProxyRuntime>,
+            rollout_path: Option<PathBuf>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let permission_profile = match (wire.permission_profile, wire.sandbox_policy) {
+            (Some(permission_profile), _) => permission_profile,
+            (None, Some(sandbox_policy)) => PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &sandbox_policy,
+                wire.cwd.as_path(),
+            ),
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("permission_profile"));
+            }
+        };
+
+        Ok(Self {
+            session_id: wire.session_id,
+            forked_from_id: wire.forked_from_id,
+            thread_name: wire.thread_name,
+            model: wire.model,
+            model_provider_id: wire.model_provider_id,
+            service_tier: wire.service_tier,
+            approval_policy: wire.approval_policy,
+            approvals_reviewer: wire.approvals_reviewer,
+            permission_profile,
+            cwd: wire.cwd,
+            reasoning_effort: wire.reasoning_effort,
+            history_log_id: wire.history_log_id,
+            history_entry_count: wire.history_entry_count,
+            initial_messages: wire.initial_messages,
+            network_proxy: wire.network_proxy,
+            rollout_path: wire.rollout_path,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ThreadNameUpdatedEvent {
     pub thread_id: ThreadId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub thread_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub enum ThreadGoalStatus {
+    Active,
+    Paused,
+    BudgetLimited,
+    Complete,
+}
+
+pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("goal objective must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Err(format!(
+            "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub struct ThreadGoal {
+    pub thread_id: ThreadId,
+    pub objective: String,
+    pub status: ThreadGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub time_used_seconds: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub struct ThreadGoalUpdatedEvent {
+    pub thread_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub turn_id: Option<String>,
+    pub goal: ThreadGoal,
 }
 
 /// User's decision in response to an ExecApprovalRequest.
@@ -3567,6 +3762,7 @@ pub enum TurnAbortReason {
     Interrupted,
     Replaced,
     ReviewEnded,
+    BudgetLimited,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3771,6 +3967,8 @@ mod tests {
     use crate::permissions::NetworkSandboxPolicy;
     use anyhow::Result;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
@@ -3794,19 +3992,8 @@ mod tests {
         sorted_roots
     }
 
-    fn sandbox_policy_allows_read(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
-        if policy.has_full_disk_read_access() {
-            return true;
-        }
-
-        policy
-            .get_readable_roots_with_cwd(cwd)
-            .iter()
-            .any(|root| path.starts_with(root.as_path()))
-            || policy
-                .get_writable_roots_with_cwd(cwd)
-                .iter()
-                .any(|root| path.starts_with(root.root.as_path()))
+    fn sandbox_policy_allows_read(policy: &SandboxPolicy, _path: &Path, _cwd: &Path) -> bool {
+        policy.has_full_disk_read_access()
     }
 
     fn sandbox_policy_allows_write(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
@@ -3845,6 +4032,28 @@ mod tests {
     }
 
     #[test]
+    fn session_source_thread_source_name_classifies_user_and_subagent_sources() {
+        for (source, expected) in [
+            (SessionSource::Cli, Some("user")),
+            (SessionSource::VSCode, Some("user")),
+            (SessionSource::Exec, Some("user")),
+            (
+                SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+                Some("internal"),
+            ),
+            (
+                SessionSource::SubAgent(SubAgentSource::Review),
+                Some("subagent"),
+            ),
+            (SessionSource::Mcp, None),
+            (SessionSource::Custom("atlas".to_string()), None),
+            (SessionSource::Unknown, None),
+        ] {
+            assert_eq!(source.thread_source_name(), expected);
+        }
+    }
+
+    #[test]
     fn session_source_restriction_product_defaults_non_subagent_sources_to_codex() {
         assert_eq!(
             SessionSource::Cli.restriction_product(),
@@ -3872,6 +4081,11 @@ mod tests {
     fn session_source_restriction_product_does_not_guess_subagent_products() {
         assert_eq!(
             SessionSource::SubAgent(SubAgentSource::Review).restriction_product(),
+            None
+        );
+        assert_eq!(
+            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+                .restriction_product(),
             None
         );
     }
@@ -3916,12 +4130,6 @@ mod tests {
 
     fn sandbox_policy_probe_paths(policy: &SandboxPolicy, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = vec![cwd.to_path_buf()];
-        paths.extend(
-            policy
-                .get_readable_roots_with_cwd(cwd)
-                .into_iter()
-                .map(|path| path.to_path_buf()),
-        );
         for root in policy.get_writable_roots_with_cwd(cwd) {
             paths.push(root.root.to_path_buf());
             paths.extend(
@@ -3951,10 +4159,6 @@ mod tests {
         assert_eq!(
             actual.has_full_network_access(),
             expected.has_full_network_access()
-        );
-        assert_eq!(
-            actual.include_platform_defaults(),
-            expected.include_platform_defaults()
         );
         let mut probe_paths = sandbox_policy_probe_paths(expected, cwd);
         probe_paths.extend(sandbox_policy_probe_paths(actual, cwd));
@@ -3998,7 +4202,6 @@ mod tests {
         assert!(!restricted.has_full_network_access());
 
         let enabled = SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::FullAccess,
             network_access: true,
         };
         assert!(enabled.has_full_network_access());
@@ -4095,38 +4298,6 @@ mod tests {
                 mcp_elicitations: true,
             }
         );
-    }
-
-    #[test]
-    fn workspace_write_restricted_read_access_includes_effective_writable_roots() {
-        let cwd = if cfg!(windows) {
-            Path::new(r"C:\workspace")
-        } else {
-            Path::new("/tmp/workspace")
-        };
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: false,
-                readable_roots: vec![],
-            },
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
-
-        let readable_roots = policy.get_readable_roots_with_cwd(cwd);
-        let writable_roots = policy.get_writable_roots_with_cwd(cwd);
-
-        for writable_root in writable_roots {
-            assert!(
-                readable_roots
-                    .iter()
-                    .any(|root| root.as_path() == writable_root.root.as_path()),
-                "expected writable root {} to also be readable",
-                writable_root.root.as_path().display()
-            );
-        }
     }
 
     #[test]
@@ -4230,7 +4401,7 @@ mod tests {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4292,7 +4463,7 @@ mod tests {
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4319,34 +4490,6 @@ mod tests {
                 ),
                 (expected_docs_public.to_path_buf(), Vec::new()),
             ]
-        );
-    }
-
-    #[test]
-    fn legacy_workspace_write_nested_readable_root_stays_writable() {
-        let cwd = TempDir::new().expect("tempdir");
-        let docs = AbsolutePathBuf::resolve_path_against_base("docs", cwd.path());
-        let canonical_cwd = codex_utils_absolute_path::canonicalize_preserving_symlinks(cwd.path())
-            .expect("canonicalize cwd");
-        let expected_dot_codex = AbsolutePathBuf::from_absolute_path(canonical_cwd.join(".codex"))
-            .expect("canonical .codex");
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                readable_roots: vec![docs],
-            },
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
-
-        assert_eq!(
-            sorted_writable_roots(
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, cwd.path())
-                    .get_writable_roots_with_cwd(cwd.path())
-            ),
-            vec![(canonical_cwd, vec![expected_dot_codex.to_path_buf()])]
         );
     }
 
@@ -4383,9 +4526,7 @@ mod tests {
     #[test]
     fn legacy_sandbox_policy_semantics_survive_split_bridge() {
         let cwd = TempDir::new().expect("tempdir");
-        let readable_root = AbsolutePathBuf::resolve_path_against_base("readable", cwd.path());
         let writable_root = AbsolutePathBuf::resolve_path_against_base("writable", cwd.path());
-        let nested_readable_root = AbsolutePathBuf::resolve_path_against_base("docs", cwd.path());
         let policies = [
             SandboxPolicy::DangerFullAccess,
             SandboxPolicy::ExternalSandbox {
@@ -4395,49 +4536,27 @@ mod tests {
                 network_access: NetworkAccess::Enabled,
             },
             SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
-            },
-            SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![readable_root.clone()],
-                },
-                network_access: true,
             },
             SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![],
-                read_only_access: ReadOnlyAccess::FullAccess,
                 network_access: false,
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             },
             SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![writable_root],
-                read_only_access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![readable_root],
-                },
                 network_access: true,
                 exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: true,
-            },
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![],
-                read_only_access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![nested_readable_root],
-                },
-                network_access: false,
-                exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             },
         ];
 
         for expected in policies {
-            let actual = FileSystemSandboxPolicy::from_legacy_sandbox_policy(&expected, cwd.path())
-                .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
-                .expect("legacy bridge should preserve legacy policy semantics");
+            let actual =
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected, cwd.path())
+                    .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
+                    .expect("legacy bridge should preserve legacy policy semantics");
 
             assert_same_sandbox_policy_semantics(&expected, &actual, cwd.path());
         }
@@ -4513,7 +4632,7 @@ mod tests {
                 status: "completed".into(),
                 revised_prompt: Some("A tiny blue square".into()),
                 result: "Zm9v".into(),
-                saved_path: Some("/tmp/ig-1.png".into()),
+                saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
             }),
         };
 
@@ -4525,7 +4644,10 @@ mod tests {
                 assert_eq!(event.status, "completed");
                 assert_eq!(event.revised_prompt.as_deref(), Some("A tiny blue square"));
                 assert_eq!(event.result, "Zm9v");
-                assert_eq!(event.saved_path.as_deref(), Some("/tmp/ig-1.png"));
+                assert_eq!(
+                    event.saved_path.as_ref().map(AbsolutePathBuf::as_path),
+                    Some(test_path_buf("/tmp/ig-1.png").as_path())
+                );
             }
             _ => panic!("expected ImageGenerationEnd event"),
         }
@@ -4572,12 +4694,14 @@ mod tests {
             },
         });
         let start = Op::RealtimeConversationStart(ConversationStartParams {
+            output_modality: RealtimeOutputModality::Audio,
             prompt: Some(Some("be helpful".to_string())),
             session_id: Some("conv_1".to_string()),
             transport: None,
             voice: None,
         });
         let webrtc_start = Op::RealtimeConversationStart(ConversationStartParams {
+            output_modality: RealtimeOutputModality::Audio,
             prompt: Some(Some("be helpful".to_string())),
             session_id: Some("conv_1".to_string()),
             transport: Some(ConversationStartTransport::Webrtc {
@@ -4590,12 +4714,14 @@ mod tests {
         });
         let close = Op::RealtimeConversationClose;
         let default_prompt_start = Op::RealtimeConversationStart(ConversationStartParams {
+            output_modality: RealtimeOutputModality::Audio,
             prompt: None,
             session_id: None,
             transport: None,
             voice: None,
         });
         let null_prompt_start = Op::RealtimeConversationStart(ConversationStartParams {
+            output_modality: RealtimeOutputModality::Audio,
             prompt: Some(None),
             session_id: None,
             transport: None,
@@ -4607,6 +4733,7 @@ mod tests {
             serde_json::to_value(&start).unwrap(),
             json!({
                 "type": "realtime_conversation_start",
+                "output_modality": "audio",
                 "prompt": "be helpful",
                 "session_id": "conv_1"
             })
@@ -4614,19 +4741,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&default_prompt_start).unwrap(),
             json!({
-                "type": "realtime_conversation_start"
+                "type": "realtime_conversation_start",
+                "output_modality": "audio"
             })
         );
         assert_eq!(
             serde_json::to_value(&null_prompt_start).unwrap(),
             json!({
                 "type": "realtime_conversation_start",
+                "output_modality": "audio",
                 "prompt": null
             })
         );
         assert_eq!(
             serde_json::from_value::<Op>(json!({
-                "type": "realtime_conversation_start"
+                "type": "realtime_conversation_start",
+                "output_modality": "audio"
             }))
             .unwrap(),
             default_prompt_start
@@ -4634,6 +4764,7 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Op>(json!({
                 "type": "realtime_conversation_start",
+                "output_modality": "audio",
                 "prompt": null
             }))
             .unwrap(),
@@ -4679,6 +4810,7 @@ mod tests {
             serde_json::to_value(&webrtc_start).unwrap(),
             json!({
                 "type": "realtime_conversation_start",
+                "output_modality": "audio",
                 "prompt": "be helpful",
                 "session_id": "conv_1",
                 "transport": {
@@ -4727,6 +4859,7 @@ mod tests {
     #[test]
     fn user_input_serialization_omits_final_output_json_schema_when_none() -> Result<()> {
         let op = Op::UserInput {
+            environments: None,
             items: Vec::new(),
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
@@ -4745,6 +4878,7 @@ mod tests {
         assert_eq!(
             op,
             Op::UserInput {
+                environments: None,
                 items: Vec::new(),
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
@@ -4765,6 +4899,7 @@ mod tests {
             "additionalProperties": false
         });
         let op = Op::UserInput {
+            environments: None,
             items: Vec::new(),
             final_output_json_schema: Some(schema.clone()),
             responsesapi_client_metadata: None,
@@ -4786,6 +4921,7 @@ mod tests {
     #[test]
     fn user_input_with_responsesapi_client_metadata_round_trips() -> Result<()> {
         let op = Op::UserInput {
+            environments: None,
             items: Vec::new(),
             final_output_json_schema: None,
             responsesapi_client_metadata: Some(HashMap::from([(
@@ -4875,7 +5011,7 @@ mod tests {
     #[test]
     fn turn_context_item_deserializes_without_network() -> Result<()> {
         let item: TurnContextItem = serde_json::from_value(json!({
-            "cwd": "/tmp",
+            "cwd": test_path_buf("/tmp"),
             "approval_policy": "never",
             "sandbox_policy": { "type": "danger-full-access" },
             "model": "gpt-5",
@@ -4884,6 +5020,7 @@ mod tests {
 
         assert_eq!(item.trace_id, None);
         assert_eq!(item.network, None);
+        assert_eq!(item.file_system_sandbox_policy, None);
         Ok(())
     }
 
@@ -4892,15 +5029,24 @@ mod tests {
         let item = TurnContextItem {
             turn_id: None,
             trace_id: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: test_path_buf("/tmp"),
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             network: Some(TurnContextNetworkItem {
                 allowed_domains: vec!["api.example.com".to_string()],
                 denied_domains: vec!["blocked.example.com".to_string()],
             }),
+            file_system_sandbox_policy: Some(FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::GlobPattern {
+                        pattern: "/tmp/private/**/*.txt".to_string(),
+                    },
+                    access: FileSystemAccessMode::None,
+                },
+            ])),
             model: "gpt-5".to_string(),
             personality: None,
             collaboration_mode: None,
@@ -4921,6 +5067,19 @@ mod tests {
                 "denied_domains": ["blocked.example.com"],
             })
         );
+        assert_eq!(
+            value["file_system_sandbox_policy"],
+            json!({
+                "kind": "restricted",
+                "entries": [{
+                    "path": {
+                        "type": "glob_pattern",
+                        "pattern": "/tmp/private/**/*.txt"
+                    },
+                    "access": "none"
+                }]
+            })
+        );
         Ok(())
     }
 
@@ -4930,6 +5089,7 @@ mod tests {
     fn serialize_event() -> Result<()> {
         let conversation_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
         let rollout_file = NamedTempFile::new()?;
+        let permission_profile = PermissionProfile::read_only();
         let event = Event {
             id: "1234".to_string(),
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -4941,8 +5101,8 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                cwd: PathBuf::from("/home/user/project"),
+                permission_profile: permission_profile.clone(),
+                cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -4961,10 +5121,8 @@ mod tests {
                 "model_provider_id": "openai",
                 "approval_policy": "never",
                 "approvals_reviewer": "user",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
-                "cwd": "/home/user/project",
+                "permission_profile": permission_profile,
+                "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": "medium",
                 "history_log_id": 0,
                 "history_entry_count": 0,
@@ -4972,6 +5130,28 @@ mod tests {
             }
         });
         assert_eq!(expected, serde_json::to_value(&event)?);
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_legacy_session_configured_event_uses_sandbox_policy() -> Result<()> {
+        let cwd = test_path_buf("/home/user/project");
+        let value = json!({
+            "session_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "model": "codex-mini-latest",
+            "model_provider_id": "openai",
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "sandbox_policy": {
+                "type": "read-only"
+            },
+            "cwd": cwd,
+            "history_log_id": 0,
+            "history_entry_count": 0,
+        });
+
+        let event: SessionConfiguredEvent = serde_json::from_value(value)?;
+        assert_eq!(event.permission_profile, PermissionProfile::read_only());
         Ok(())
     }
 

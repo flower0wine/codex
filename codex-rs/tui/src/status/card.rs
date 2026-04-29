@@ -9,16 +9,16 @@ use chrono::Local;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::NetworkAccess;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
-use codex_utils_sandbox_summary::summarize_sandbox_policy;
+use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::path::PathBuf;
 use url::Url;
 
@@ -254,12 +254,15 @@ impl StatusHistoryCell {
             ),
             (
                 "sandbox",
-                summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
+                summarize_permission_profile(
+                    &config.permissions.permission_profile(),
+                    config.cwd.as_path(),
+                ),
             ),
         ];
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
-                .unwrap_or(None)
+                .unwrap_or(config.model_reasoning_effort)
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "none".to_string());
             config_entries.push(("reasoning effort", effort_value));
@@ -277,29 +280,14 @@ impl StatusHistoryCell {
             .find(|(k, _)| *k == "approval")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let sandbox = match config.permissions.sandbox_policy.get() {
-            SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
-            SandboxPolicy::WorkspaceWrite {
-                network_access: true,
-                ..
-            } => "workspace-write with network access".to_string(),
-            SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
-            SandboxPolicy::ExternalSandbox { network_access } => {
-                if matches!(network_access, NetworkAccess::Enabled) {
-                    "external-sandbox (network access enabled)".to_string()
-                } else {
-                    "external-sandbox".to_string()
-                }
-            }
-        };
+        let permission_profile = config.permissions.permission_profile();
+        let sandbox = status_permission_summary(&permission_profile, config.cwd.as_path());
         let permissions = if config.permissions.approval_policy.value() == AskForApproval::OnRequest
-            && *config.permissions.sandbox_policy.get()
-                == SandboxPolicy::new_workspace_write_policy()
+            && permission_profile == PermissionProfile::workspace_write()
         {
             "Default".to_string()
         } else if config.permissions.approval_policy.value() == AskForApproval::Never
-            && *config.permissions.sandbox_policy.get() == SandboxPolicy::DangerFullAccess
+            && permission_profile == PermissionProfile::Disabled
         {
             "Full Access".to_string()
         } else {
@@ -457,11 +445,21 @@ impl StatusHistoryCell {
                     resets_at,
                 } => {
                     let percent_remaining = (100.0 - percent_used).clamp(0.0, 100.0);
-                    let value_spans = vec![
+                    let summary = format_status_limit_summary(percent_remaining);
+                    let full_value_spans = vec![
                         Span::from(render_status_limit_progress_bar(percent_remaining)),
                         Span::from(" "),
-                        Span::from(format_status_limit_summary(percent_remaining)),
+                        Span::from(summary.clone()),
                     ];
+                    // On narrow terminals, keep the percentage visible rather than
+                    // letting the fixed-width progress bar crowd out the reset time.
+                    let value_spans = if line_display_width(&Line::from(full_value_spans.clone()))
+                        <= formatter.value_width(available_inner_width)
+                    {
+                        full_value_spans
+                    } else {
+                        vec![Span::from(summary)]
+                    };
                     let base_spans = formatter.full_spans(row.label.as_str(), value_spans);
                     let base_line = Line::from(base_spans.clone());
 
@@ -477,7 +475,21 @@ impl StatusHistoryCell {
                             lines.push(Line::from(inline_spans));
                         } else {
                             lines.push(base_line);
-                            lines.push(formatter.continuation(vec![resets_span]));
+                            let reset_text = format!("(resets {resets_at})");
+                            let reset_width = formatter.value_width(available_inner_width).max(1);
+                            let wrap_options =
+                                textwrap::Options::new(reset_width).break_words(false);
+                            // Reset timestamps are the actionable part of this row, so wrap them
+                            // onto continuation lines instead of truncating partial times/dates.
+                            lines.extend(
+                                textwrap::wrap(reset_text.as_str(), wrap_options)
+                                    .into_iter()
+                                    .map(|wrapped| {
+                                        formatter.continuation(vec![
+                                            Span::from(wrapped.into_owned()).dim(),
+                                        ])
+                                    }),
+                            );
                         }
                     } else {
                         lines.push(base_line);
@@ -521,6 +533,20 @@ impl StatusHistoryCell {
             StatusRateLimitData::Missing => push_label(labels, seen, "Limits"),
         }
     }
+}
+
+fn status_permission_summary(permission_profile: &PermissionProfile, cwd: &Path) -> String {
+    let summary = summarize_permission_profile(permission_profile, cwd);
+    if let Some(details) = summary.strip_prefix("workspace-write") {
+        if details.contains("(network access enabled)") {
+            return "workspace-write with network access".to_string();
+        }
+        return "workspace-write".to_string();
+    }
+    if summary == "custom permissions (network access enabled)" {
+        return "custom permissions with network access".to_string();
+    }
+    summary
 }
 
 impl HistoryCell for StatusHistoryCell {
