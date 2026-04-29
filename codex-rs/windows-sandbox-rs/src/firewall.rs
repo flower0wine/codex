@@ -303,30 +303,7 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
                 format!("SetProfiles failed: {err:?}"),
             ))
         })?;
-        rule.SetProtocol(spec.protocol).map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                format!("SetProtocol failed: {err:?}"),
-            ))
-        })?;
-        let remote_addresses = spec.remote_addresses.unwrap_or("*");
-        rule.SetRemoteAddresses(&BSTR::from(remote_addresses))
-            .map_err(|err| {
-                anyhow::Error::new(SetupFailure::new(
-                    SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                    format!("SetRemoteAddresses failed: {err:?}"),
-                ))
-            })?;
-        if protocol_supports_remote_ports(spec.protocol) {
-            let remote_ports = spec.remote_ports.unwrap_or("*");
-            rule.SetRemotePorts(&BSTR::from(remote_ports))
-                .map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetRemotePorts failed: {err:?}"),
-                    ))
-                })?;
-        }
+        configure_rule_network_scope(rule, spec)?;
         rule.SetLocalUserAuthorizedList(&BSTR::from(spec.local_user_spec))
             .map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
@@ -356,8 +333,34 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
     Ok(())
 }
 
-fn protocol_supports_remote_ports(protocol: i32) -> bool {
-    protocol == NET_FW_IP_PROTOCOL_TCP.0 || protocol == NET_FW_IP_PROTOCOL_UDP.0
+fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
+    unsafe {
+        rule.SetProtocol(spec.protocol).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                format!("SetProtocol failed: {err:?}"),
+            ))
+        })?;
+        let remote_addresses = spec.remote_addresses.unwrap_or("*");
+        rule.SetRemoteAddresses(&BSTR::from(remote_addresses))
+            .map_err(|err| {
+                anyhow::Error::new(SetupFailure::new(
+                    SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                    format!("SetRemoteAddresses failed: {err:?}"),
+                ))
+            })?;
+        if let Some(remote_ports) = spec.remote_ports {
+            rule.SetRemotePorts(&BSTR::from(remote_ports))
+                .map_err(|err| {
+                    anyhow::Error::new(SetupFailure::new(
+                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                        format!("SetRemotePorts failed: {err:?}"),
+                    ))
+                })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String> {
@@ -412,13 +415,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_ports_supported_only_for_tcp_udp() {
-        assert!(protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_TCP.0));
-        assert!(protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_UDP.0));
-        assert!(!protocol_supports_remote_ports(NET_FW_IP_PROTOCOL_ANY.0));
-    }
-
-    #[test]
     fn configured_remote_address_literals_are_accepted_by_firewall_com() {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
@@ -446,6 +442,70 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "firewall rejected RemoteAddresses={remote_addresses:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_firewall_rule_network_scopes_are_accepted_by_firewall_com() {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
+
+        let local_user_spec = "O:LSD:(A;;CC;;;S-1-5-18)";
+        let offline_sid = "S-1-5-18";
+        let blocked_remote_ports =
+            blocked_loopback_tcp_remote_ports(&[8080]).expect("proxy-port complement should exist");
+        let specs = [
+            BlockRuleSpec {
+                internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
+                friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
+                protocol: NET_FW_IP_PROTOCOL_UDP.0,
+                local_user_spec,
+                offline_sid,
+                remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
+                remote_ports: None,
+            },
+            BlockRuleSpec {
+                internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
+                friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                protocol: NET_FW_IP_PROTOCOL_TCP.0,
+                local_user_spec,
+                offline_sid,
+                remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
+                remote_ports: Some(&blocked_remote_ports),
+            },
+            BlockRuleSpec {
+                internal_name: OFFLINE_BLOCK_RULE_NAME,
+                friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
+                protocol: NET_FW_IP_PROTOCOL_ANY.0,
+                local_user_spec,
+                offline_sid,
+                remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
+                remote_ports: None,
+            },
+        ];
+
+        let results = specs.each_ref().map(|spec| unsafe {
+            let rule: windows::core::Result<INetFwRule3> =
+                CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER);
+            match rule {
+                Ok(rule) => configure_rule_network_scope(&rule, spec),
+                Err(err) => Err(err.into()),
+            }
+        });
+
+        unsafe {
+            CoUninitialize();
+        }
+
+        for (spec, result) in specs.into_iter().zip(results) {
+            assert!(
+                result.is_ok(),
+                "firewall rejected network scope for rule={} protocol={} remote_addresses={:?} remote_ports={:?}: {result:?}",
+                spec.internal_name,
+                spec.protocol,
+                spec.remote_addresses,
+                spec.remote_ports
             );
         }
     }

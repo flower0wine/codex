@@ -276,6 +276,7 @@ Argument parsing notes:
             use_private_desktop,
             proxy_enforced,
             read_roots_override,
+            read_roots_include_platform_defaults: false,
             write_roots_override,
             deny_write_paths_override: deny_write_paths.as_slice(),
         })?,

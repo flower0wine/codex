@@ -2,8 +2,8 @@ use crate::codex_message_processor::ApiVersion;
 use crate::codex_message_processor::read_rollout_items_from_rollout;
 use crate::codex_message_processor::read_summary_from_rollout;
 use crate::codex_message_processor::summary_to_thread;
-use crate::error_code::INTERNAL_ERROR_CODE;
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::error_code::internal_error;
+use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::server_request_error::is_turn_transition_server_request_error;
@@ -12,6 +12,7 @@ use crate::thread_state::TurnSummary;
 use crate::thread_state::resolve_server_request_on_thread_listener;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
+use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
 use codex_app_server_protocol::AgentMessageDeltaNotification;
@@ -39,16 +40,17 @@ use codex_app_server_protocol::ExecCommandApprovalResponse;
 use codex_app_server_protocol::ExecPolicyAmendment as V2ExecPolicyAmendment;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeOutputDeltaNotification;
+use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
+use codex_app_server_protocol::GuardianWarningNotification;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
@@ -58,6 +60,7 @@ use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::ModelReroutedNotification;
+use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::NetworkApprovalContext as V2NetworkApprovalContext;
 use codex_app_server_protocol::NetworkPolicyAmendment as V2NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction as V2NetworkPolicyRuleAction;
@@ -74,6 +77,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::TerminalInteractionNotification;
+use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -82,7 +86,8 @@ use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
 use codex_app_server_protocol::ThreadRealtimeOutputAudioDeltaNotification;
 use codex_app_server_protocol::ThreadRealtimeSdpNotification;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
-use codex_app_server_protocol::ThreadRealtimeTranscriptUpdatedNotification;
+use codex_app_server_protocol::ThreadRealtimeTranscriptDeltaNotification;
+use codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -99,6 +104,7 @@ use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_command_execution_end_item;
 use codex_app_server_protocol::build_file_change_approval_request_item;
 use codex_app_server_protocol::build_file_change_begin_item;
@@ -116,6 +122,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::items::parse_hook_prompt_message;
+use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
@@ -138,9 +145,9 @@ use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUse
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::shlex_join;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -157,7 +164,7 @@ enum CommandExecutionApprovalPresentation {
 #[derive(Debug, PartialEq)]
 struct CommandExecutionCompletionItem {
     command: String,
-    cwd: PathBuf,
+    cwd: AbsolutePathBuf,
     command_actions: Vec<V2ParsedCommand>,
 }
 
@@ -167,9 +174,11 @@ pub(crate) async fn apply_bespoke_event_handling(
     conversation_id: ThreadId,
     conversation: Arc<CodexThread>,
     thread_manager: Arc<ThreadManager>,
+    analytics_events_client: Option<AnalyticsEventsClient>,
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
     thread_watch_manager: ThreadWatchManager,
+    thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     api_version: ApiVersion,
     fallback_model_provider: String,
     codex_home: &Path,
@@ -202,6 +211,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: conversation_id.to_string(),
                     turn,
                 };
+                if let Some(analytics_events_client) = analytics_events_client.as_ref() {
+                    analytics_events_client
+                        .track_notification(ServerNotification::TurnStarted(notification.clone()));
+                }
                 outgoing
                     .send_server_notification(ServerNotification::TurnStarted(notification))
                     .await;
@@ -210,6 +223,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
+            respond_to_pending_interrupts(&thread_state, &outgoing, /*abort_reason*/ None).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -218,6 +232,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 conversation_id,
                 event_turn_id,
                 turn_complete_event,
+                analytics_events_client.as_ref(),
                 &outgoing,
                 &thread_state,
             )
@@ -260,7 +275,37 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
-        EventMsg::Warning(_warning_event) => {}
+        EventMsg::Warning(warning_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = WarningNotification {
+                    thread_id: Some(conversation_id.to_string()),
+                    message: warning_event.message,
+                };
+                if let Some(analytics_events_client) = analytics_events_client.as_ref() {
+                    analytics_events_client
+                        .track_notification(ServerNotification::Warning(notification.clone()));
+                }
+                outgoing
+                    .send_server_notification(ServerNotification::Warning(notification))
+                    .await;
+            }
+        }
+        EventMsg::GuardianWarning(warning_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = GuardianWarningNotification {
+                    thread_id: conversation_id.to_string(),
+                    message: warning_event.message,
+                };
+                if let Some(analytics_events_client) = analytics_events_client.as_ref() {
+                    analytics_events_client.track_notification(
+                        ServerNotification::GuardianWarning(notification.clone()),
+                    );
+                }
+                outgoing
+                    .send_server_notification(ServerNotification::GuardianWarning(notification))
+                    .await;
+            }
+        }
         EventMsg::GuardianAssessment(assessment) => {
             if let ApiVersion::V2 = api_version {
                 let pending_command_execution = match build_item_from_guardian_event(
@@ -357,6 +402,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
+        EventMsg::ModelVerification(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ModelVerificationNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    verifications: event.verifications.into_iter().map(Into::into).collect(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ModelVerification(notification))
+                    .await;
+            }
+        }
         EventMsg::RealtimeConversationStarted(event) => {
             if let ApiVersion::V2 = api_version {
                 let notification = ThreadRealtimeStartedNotification {
@@ -401,26 +458,50 @@ pub(crate) async fn apply_bespoke_event_handling(
                             .await;
                     }
                     RealtimeEvent::InputTranscriptDelta(event) => {
-                        let notification = ThreadRealtimeTranscriptUpdatedNotification {
+                        let notification = ThreadRealtimeTranscriptDeltaNotification {
                             thread_id: conversation_id.to_string(),
                             role: "user".to_string(),
-                            text: event.delta,
+                            delta: event.delta,
                         };
                         outgoing
                             .send_server_notification(
-                                ServerNotification::ThreadRealtimeTranscriptUpdated(notification),
+                                ServerNotification::ThreadRealtimeTranscriptDelta(notification),
+                            )
+                            .await;
+                    }
+                    RealtimeEvent::InputTranscriptDone(event) => {
+                        let notification = ThreadRealtimeTranscriptDoneNotification {
+                            thread_id: conversation_id.to_string(),
+                            role: "user".to_string(),
+                            text: event.text,
+                        };
+                        outgoing
+                            .send_server_notification(
+                                ServerNotification::ThreadRealtimeTranscriptDone(notification),
                             )
                             .await;
                     }
                     RealtimeEvent::OutputTranscriptDelta(event) => {
-                        let notification = ThreadRealtimeTranscriptUpdatedNotification {
+                        let notification = ThreadRealtimeTranscriptDeltaNotification {
                             thread_id: conversation_id.to_string(),
                             role: "assistant".to_string(),
-                            text: event.delta,
+                            delta: event.delta,
                         };
                         outgoing
                             .send_server_notification(
-                                ServerNotification::ThreadRealtimeTranscriptUpdated(notification),
+                                ServerNotification::ThreadRealtimeTranscriptDelta(notification),
+                            )
+                            .await;
+                    }
+                    RealtimeEvent::OutputTranscriptDone(event) => {
+                        let notification = ThreadRealtimeTranscriptDoneNotification {
+                            thread_id: conversation_id.to_string(),
+                            role: "assistant".to_string(),
+                            text: event.text,
+                        };
+                        outgoing
+                            .send_server_notification(
+                                ServerNotification::ThreadRealtimeTranscriptDone(notification),
                             )
                             .await;
                     }
@@ -462,7 +543,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                             ))
                             .await;
                     }
-                    RealtimeEvent::ConversationItemDone { .. } => {}
+                    RealtimeEvent::ConversationItemDone { .. }
+                    | RealtimeEvent::NoopRequested(_) => {}
                     RealtimeEvent::HandoffRequested(handoff) => {
                         let notification = ThreadRealtimeItemAddedNotification {
                             thread_id: conversation_id.to_string(),
@@ -612,7 +694,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         call_id: call_id.clone(),
                         approval_id,
                         command,
-                        cwd,
+                        cwd: cwd.to_path_buf(),
                         reason,
                         parsed_cmd,
                     };
@@ -634,7 +716,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     let command_actions = parsed_cmd
                         .iter()
                         .cloned()
-                        .map(V2ParsedCommand::from)
+                        .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
                         .collect::<Vec<_>>();
                     let presentation = if let Some(network_approval_context) =
                         network_approval_context.map(V2NetworkApprovalContext::from)
@@ -859,27 +941,32 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .note_permission_requested(&conversation_id.to_string())
                     .await;
                 let requested_permissions = request.permissions.clone();
+                let request_cwd = match request.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => conversation.config_snapshot().await.cwd,
+                };
                 let params = PermissionsRequestApprovalParams {
                     thread_id: conversation_id.to_string(),
                     turn_id: request.turn_id.clone(),
                     item_id: request.call_id.clone(),
+                    cwd: request_cwd.clone(),
                     reason: request.reason,
                     permissions: request.permissions.into(),
                 };
                 let (pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::PermissionsRequestApproval(params))
                     .await;
+                let pending_response = PendingRequestPermissionsResponse {
+                    call_id: request.call_id,
+                    requested_permissions,
+                    request_cwd,
+                    pending_request_id,
+                    receiver: rx,
+                    request_permissions_guard: permission_guard,
+                };
                 tokio::spawn(async move {
-                    on_request_permissions_response(
-                        request.call_id,
-                        requested_permissions,
-                        pending_request_id,
-                        rx,
-                        conversation,
-                        thread_state,
-                        permission_guard,
-                    )
-                    .await;
+                    on_request_permissions_response(pending_response, conversation, thread_state)
+                        .await;
                 });
             } else {
                 error!(
@@ -889,6 +976,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let empty = CoreRequestPermissionsResponse {
                     permissions: Default::default(),
                     scope: CorePermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 };
                 if let Err(err) = conversation
                     .submit(Op::RequestPermissionsResponse {
@@ -905,10 +993,12 @@ pub(crate) async fn apply_bespoke_event_handling(
             if matches!(api_version, ApiVersion::V2) {
                 let call_id = request.call_id;
                 let turn_id = request.turn_id;
+                let namespace = request.namespace;
                 let tool = request.tool;
                 let arguments = request.arguments;
                 let item = ThreadItem::DynamicToolCall {
                     id: call_id.clone(),
+                    namespace: namespace.clone(),
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                     status: DynamicToolCallStatus::InProgress,
@@ -928,6 +1018,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: conversation_id.to_string(),
                     turn_id: turn_id.clone(),
                     call_id: call_id.clone(),
+                    namespace,
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                 };
@@ -966,6 +1057,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let duration_ms = i64::try_from(response.duration.as_millis()).ok();
                 let item = ThreadItem::DynamicToolCall {
                     id: response.call_id,
+                    namespace: response.namespace,
                     tool: response.tool,
                     arguments: response.arguments,
                     status,
@@ -1303,6 +1395,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::ContextCompacted(..) => {
+            // Core still fans out this deprecated event for legacy clients;
+            // v2 clients receive the canonical ContextCompaction item instead.
+            if matches!(api_version, ApiVersion::V2) {
+                return;
+            }
             let notification = ContextCompactedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
@@ -1426,7 +1523,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ViewImageToolCall(view_image_event) => {
             let item = ThreadItem::ImageView {
                 id: view_image_event.call_id.clone(),
-                path: view_image_event.path.to_string_lossy().into_owned(),
+                path: view_image_event.path.clone(),
             };
             let started = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1584,6 +1681,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
+        EventMsg::PatchApplyUpdated(event) => {
+            let notification = FileChangePatchUpdatedNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                item_id: event.call_id,
+                changes: convert_patch_changes(&event.changes),
+            };
+            outgoing
+                .send_server_notification(ServerNotification::FileChangePatchUpdated(notification))
+                .await;
+        }
         EventMsg::PatchApplyEnd(patch_end_event) => {
             // Until we migrate the core to be aware of a first class FileChangeItem
             // and emit the corresponding EventMsg, we repurpose the call_id as the item_id.
@@ -1599,14 +1707,25 @@ pub(crate) async fn apply_bespoke_event_handling(
             .await;
         }
         EventMsg::ExecCommandBegin(exec_command_begin_event) => {
+            if matches!(api_version, ApiVersion::V2)
+                && matches!(
+                    exec_command_begin_event.source,
+                    codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
+                )
+            {
+                // TerminalInteraction is the v2 surface for unified exec
+                // stdin/poll events. Suppress the legacy CommandExecution
+                // item so clients do not render the same wait twice.
+                return;
+            }
             let item_id = exec_command_begin_event.call_id.clone();
+            let cwd = exec_command_begin_event.cwd.clone();
             let command_actions = exec_command_begin_event
                 .parsed_cmd
                 .into_iter()
-                .map(V2ParsedCommand::from)
+                .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
                 .collect::<Vec<_>>();
             let command = shlex_join(&exec_command_begin_event.command);
-            let cwd = exec_command_begin_event.cwd;
             let process_id = exec_command_begin_event.process_id;
             let first_start = {
                 let mut state = thread_state.lock().await;
@@ -1702,6 +1821,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .command_execution_started
                     .remove(&call_id);
             }
+            if matches!(api_version, ApiVersion::V2)
+                && matches!(
+                    exec_command_end_event.source,
+                    codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
+                )
+            {
+                // The paired begin event is suppressed above; keep the
+                // completion out of v2 as well so no orphan legacy item is
+                // emitted for unified exec interactions.
+                return;
+            }
 
             let item = build_command_execution_end_item(&exec_command_end_event);
 
@@ -1718,26 +1848,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            let pending = {
-                let mut state = thread_state.lock().await;
-                std::mem::take(&mut state.pending_interrupts)
-            };
-            if !pending.is_empty() {
-                for (rid, ver) in pending {
-                    match ver {
-                        ApiVersion::V1 => {
-                            let response = InterruptConversationResponse {
-                                abort_reason: turn_aborted_event.reason.clone(),
-                            };
-                            outgoing.send_response(rid, response).await;
-                        }
-                        ApiVersion::V2 => {
-                            let response = TurnInterruptResponse {};
-                            outgoing.send_response(rid, response).await;
-                        }
-                    }
-                }
-            }
+            respond_to_pending_interrupts(
+                &thread_state,
+                &outgoing,
+                Some(turn_aborted_event.reason.clone()),
+            )
+            .await;
 
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
@@ -1746,6 +1862,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 conversation_id,
                 event_turn_id,
                 turn_aborted_event,
+                analytics_events_client.as_ref(),
                 &outgoing,
                 &thread_state,
             )
@@ -1758,13 +1875,27 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
 
             if let Some(request_id) = pending {
+                let _thread_list_state_permit = match thread_list_state_permit.acquire().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        outgoing
+                            .send_error(
+                                request_id,
+                                internal_error(format!(
+                                    "failed to acquire thread list state permit: {err}"
+                                )),
+                            )
+                            .await;
+                        return;
+                    }
+                };
                 let Some(rollout_path) = conversation.rollout_path() else {
-                    let error = JSONRPCErrorError {
-                        code: INVALID_REQUEST_ERROR_CODE,
-                        message: "thread has no persisted rollout".to_string(),
-                        data: None,
-                    };
-                    outgoing.send_error(request_id, error).await;
+                    outgoing
+                        .send_error(
+                            request_id,
+                            invalid_request("thread has no persisted rollout"),
+                        )
+                        .await;
                     return;
                 };
                 let response = match read_summary_from_rollout(
@@ -1774,7 +1905,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await
                 {
                     Ok(summary) => {
-                        let mut thread = summary_to_thread(summary);
+                        let fallback_cwd = conversation.config_snapshot().await.cwd;
+                        let mut thread = summary_to_thread(summary, &fallback_cwd);
                         match read_rollout_items_from_rollout(rollout_path.as_path()).await {
                             Ok(items) => {
                                 thread.turns = build_turns_from_rollout_items(&items);
@@ -1794,29 +1926,29 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 ThreadRollbackResponse { thread }
                             }
                             Err(err) => {
-                                let error = JSONRPCErrorError {
-                                    code: INTERNAL_ERROR_CODE,
-                                    message: format!(
-                                        "failed to load rollout `{}`: {err}",
-                                        rollout_path.display()
-                                    ),
-                                    data: None,
-                                };
-                                outgoing.send_error(request_id.clone(), error).await;
+                                outgoing
+                                    .send_error(
+                                        request_id.clone(),
+                                        internal_error(format!(
+                                            "failed to load rollout `{}`: {err}",
+                                            rollout_path.display()
+                                        )),
+                                    )
+                                    .await;
                                 return;
                             }
                         }
                     }
                     Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INTERNAL_ERROR_CODE,
-                            message: format!(
-                                "failed to load rollout `{}`: {err}",
-                                rollout_path.display()
-                            ),
-                            data: None,
-                        };
-                        outgoing.send_error(request_id.clone(), error).await;
+                        outgoing
+                            .send_error(
+                                request_id.clone(),
+                                internal_error(format!(
+                                    "failed to load rollout `{}`: {err}",
+                                    rollout_path.display()
+                                )),
+                            )
+                            .await;
                         return;
                     }
                 };
@@ -1832,6 +1964,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 };
                 outgoing
                     .send_global_server_notification(ServerNotification::ThreadNameUpdated(
+                        notification,
+                    ))
+                    .await;
+            }
+        }
+        EventMsg::ThreadGoalUpdated(thread_goal_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ThreadGoalUpdatedNotification {
+                    thread_id: thread_goal_event.thread_id.to_string(),
+                    turn_id: thread_goal_event.turn_id,
+                    goal: thread_goal_event.goal.clone().into(),
+                };
+                outgoing
+                    .send_global_server_notification(ServerNotification::ThreadGoalUpdated(
                         notification,
                     ))
                     .await;
@@ -1923,6 +2069,7 @@ async fn emit_turn_completed_with_status(
     conversation_id: ThreadId,
     event_turn_id: String,
     turn_completion_metadata: TurnCompletionMetadata,
+    analytics_events_client: Option<&AnalyticsEventsClient>,
     outgoing: &ThreadScopedOutgoingMessageSender,
 ) {
     let notification = TurnCompletedNotification {
@@ -1937,6 +2084,10 @@ async fn emit_turn_completed_with_status(
             duration_ms: turn_completion_metadata.duration_ms,
         },
     };
+    if let Some(analytics_events_client) = analytics_events_client {
+        analytics_events_client
+            .track_notification(ServerNotification::TurnCompleted(notification.clone()));
+    }
     outgoing
         .send_server_notification(ServerNotification::TurnCompleted(notification))
         .await;
@@ -1950,9 +2101,12 @@ async fn complete_file_change_item(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
-    let mut state = thread_state.lock().await;
-    state.turn_summary.file_change_started.remove(&item_id);
-    drop(state);
+    thread_state
+        .lock()
+        .await
+        .turn_summary
+        .file_change_started
+        .remove(&item_id);
 
     let notification = ItemCompletedNotification {
         thread_id: conversation_id.to_string(),
@@ -1970,7 +2124,7 @@ async fn start_command_execution_item(
     turn_id: String,
     item_id: String,
     command: String,
-    cwd: PathBuf,
+    cwd: AbsolutePathBuf,
     command_actions: Vec<V2ParsedCommand>,
     source: CommandExecutionSource,
     outgoing: &ThreadScopedOutgoingMessageSender,
@@ -2013,7 +2167,7 @@ async fn complete_command_execution_item(
     turn_id: String,
     item_id: String,
     command: String,
-    cwd: PathBuf,
+    cwd: AbsolutePathBuf,
     process_id: Option<String>,
     source: CommandExecutionSource,
     command_actions: Vec<V2ParsedCommand>,
@@ -2021,12 +2175,12 @@ async fn complete_command_execution_item(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
-    let mut state = thread_state.lock().await;
-    let should_emit = state
+    let should_emit = thread_state
+        .lock()
+        .await
         .turn_summary
         .command_execution_started
         .remove(&item_id);
-    drop(state);
     if !should_emit {
         return;
     }
@@ -2129,6 +2283,7 @@ async fn handle_turn_complete(
     conversation_id: ThreadId,
     event_turn_id: String,
     turn_complete_event: TurnCompleteEvent,
+    analytics_events_client: Option<&AnalyticsEventsClient>,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
@@ -2149,6 +2304,7 @@ async fn handle_turn_complete(
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
         },
+        analytics_events_client,
         outgoing,
     )
     .await;
@@ -2158,6 +2314,7 @@ async fn handle_turn_interrupted(
     conversation_id: ThreadId,
     event_turn_id: String,
     turn_aborted_event: TurnAbortedEvent,
+    analytics_events_client: Option<&AnalyticsEventsClient>,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
@@ -2173,6 +2330,7 @@ async fn handle_turn_interrupted(
             completed_at: turn_aborted_event.completed_at,
             duration_ms: turn_aborted_event.duration_ms,
         },
+        analytics_events_client,
         outgoing,
     )
     .await;
@@ -2188,15 +2346,35 @@ async fn handle_thread_rollback_failed(
 
     if let Some(request_id) = pending_rollback {
         outgoing
-            .send_error(
-                request_id,
-                JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: message.clone(),
-                    data: None,
-                },
-            )
+            .send_error(request_id, invalid_request(message))
             .await;
+    }
+}
+
+async fn respond_to_pending_interrupts(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    abort_reason: Option<codex_protocol::protocol::TurnAbortReason>,
+) {
+    let pending = {
+        let mut state = thread_state.lock().await;
+        std::mem::take(&mut state.pending_interrupts)
+    };
+
+    for (rid, ver) in pending {
+        match ver {
+            ApiVersion::V1 => {
+                let Some(abort_reason) = abort_reason.clone() else {
+                    debug_assert!(false, "v1 interrupts only resolve from TurnAborted");
+                    continue;
+                };
+                let response = InterruptConversationResponse { abort_reason };
+                outgoing.send_response(rid, response).await;
+            }
+            ApiVersion::V2 => {
+                outgoing.send_response(rid, TurnInterruptResponse {}).await;
+            }
+        }
     }
 }
 
@@ -2485,20 +2663,26 @@ fn mcp_server_elicitation_response_from_client_result(
 }
 
 async fn on_request_permissions_response(
-    call_id: String,
-    requested_permissions: CoreRequestPermissionProfile,
-    pending_request_id: RequestId,
-    receiver: oneshot::Receiver<ClientRequestResult>,
+    pending_response: PendingRequestPermissionsResponse,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
-    request_permissions_guard: ThreadWatchActiveGuard,
 ) {
+    let PendingRequestPermissionsResponse {
+        call_id,
+        requested_permissions,
+        request_cwd,
+        pending_request_id,
+        receiver,
+        request_permissions_guard,
+    } = pending_response;
     let response = receiver.await;
     resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(request_permissions_guard);
-    let Some(response) =
-        request_permissions_response_from_client_result(requested_permissions, response)
-    else {
+    let Some(response) = request_permissions_response_from_client_result(
+        requested_permissions,
+        response,
+        request_cwd.as_path(),
+    ) else {
         return;
     };
 
@@ -2513,9 +2697,19 @@ async fn on_request_permissions_response(
     }
 }
 
+struct PendingRequestPermissionsResponse {
+    call_id: String,
+    requested_permissions: CoreRequestPermissionProfile,
+    request_cwd: AbsolutePathBuf,
+    pending_request_id: RequestId,
+    receiver: oneshot::Receiver<ClientRequestResult>,
+    request_permissions_guard: ThreadWatchActiveGuard,
+}
+
 fn request_permissions_response_from_client_result(
     requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
+    cwd: &std::path::Path,
 ) -> Option<CoreRequestPermissionsResponse> {
     let value = match response {
         Ok(Ok(value)) => value,
@@ -2525,6 +2719,7 @@ fn request_permissions_response_from_client_result(
             return Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
             });
         }
         Err(err) => {
@@ -2532,6 +2727,7 @@ fn request_permissions_response_from_client_result(
             return Some(CoreRequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
             });
         }
     };
@@ -2542,15 +2738,33 @@ fn request_permissions_response_from_client_result(
             PermissionsRequestApprovalResponse {
                 permissions: V2GrantedPermissionProfile::default(),
                 scope: codex_app_server_protocol::PermissionGrantScope::Turn,
+                strict_auto_review: None,
             }
         });
-    Some(CoreRequestPermissionsResponse {
-        permissions: intersect_permission_profiles(
-            requested_permissions.into(),
-            response.permissions.into(),
+    let strict_auto_review = response.strict_auto_review.unwrap_or(false);
+    if strict_auto_review
+        && matches!(
+            response.scope,
+            codex_app_server_protocol::PermissionGrantScope::Session
         )
-        .into(),
+    {
+        error!("strict auto review is only supported for turn-scoped permission grants");
+        return Some(CoreRequestPermissionsResponse {
+            permissions: Default::default(),
+            scope: CorePermissionGrantScope::Turn,
+            strict_auto_review: false,
+        });
+    }
+    let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.into();
+    let permissions = if granted_permissions.is_empty() {
+        CoreRequestPermissionProfile::default()
+    } else {
+        intersect_permission_profiles(requested_permissions.into(), granted_permissions, cwd).into()
+    };
+    Some(CoreRequestPermissionsResponse {
+        permissions,
         scope: response.scope.to_core(),
+        strict_auto_review,
     })
 }
 
@@ -2840,6 +3054,7 @@ async fn construct_mcp_tool_call_notification(
         tool: begin_event.invocation.tool,
         status: McpToolCallStatus::InProgress,
         arguments: begin_event.invocation.arguments.unwrap_or(JsonValue::Null),
+        mcp_app_resource_uri: begin_event.mcp_app_resource_uri,
         result: None,
         error: None,
         duration_ms: None,
@@ -2866,11 +3081,11 @@ async fn construct_mcp_tool_call_end_notification(
 
     let (result, error) = match &end_event.result {
         Ok(value) => (
-            Some(McpToolCallResult {
+            Some(Box::new(McpToolCallResult {
                 content: value.content.clone(),
                 structured_content: value.structured_content.clone(),
                 meta: value.meta.clone(),
-            }),
+            })),
             None,
         ),
         Err(message) => (
@@ -2887,6 +3102,7 @@ async fn construct_mcp_tool_call_end_notification(
         tool: end_event.invocation.tool,
         status,
         arguments: end_event.invocation.arguments.unwrap_or(JsonValue::Null),
+        mcp_app_resource_uri: end_event.mcp_app_resource_uri,
         result,
         error,
         duration_ms,
@@ -2913,12 +3129,17 @@ mod tests {
     use codex_app_server_protocol::GuardianApprovalReviewStatus;
     use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::TurnPlanStepStatus;
+    use codex_login::AuthManager;
     use codex_login::CodexAuth;
     use codex_protocol::items::HookPromptFragment;
     use codex_protocol::items::build_hook_prompt_message;
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
     use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::CollabResumeBeginEvent;
@@ -2932,6 +3153,8 @@ mod tests {
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use core_test_support::load_default_config_for_test;
     use pretty_assertions::assert_eq;
     use rmcp::model::Content;
@@ -2969,6 +3192,7 @@ mod tests {
             last_agent_message: None,
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
+            time_to_first_token_ms: None,
         }
     }
 
@@ -2984,7 +3208,7 @@ mod tests {
     fn command_execution_completion_item(command: &str) -> CommandExecutionCompletionItem {
         CommandExecutionCompletionItem {
             command: command.to_string(),
-            cwd: PathBuf::from("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             command_actions: vec![V2ParsedCommand::Unknown {
                 command: command.to_string(),
             }],
@@ -3030,7 +3254,7 @@ mod tests {
                 "type": "command",
                 "source": "shell",
                 "command": format!("rm -f /tmp/{id}.sqlite"),
-                "cwd": "/tmp",
+                "cwd": test_path_buf("/tmp"),
             }))
             .expect("guardian action"),
         }
@@ -3043,6 +3267,7 @@ mod tests {
         outgoing: ThreadScopedOutgoingMessageSender,
         thread_state: Arc<Mutex<ThreadState>>,
         thread_watch_manager: ThreadWatchManager,
+        analytics_events_client: AnalyticsEventsClient,
         codex_home: PathBuf,
     }
 
@@ -3057,9 +3282,11 @@ mod tests {
                 self.conversation_id,
                 self.conversation.clone(),
                 self.thread_manager.clone(),
+                Some(self.analytics_events_client.clone()),
                 self.outgoing.clone(),
                 self.thread_state.clone(),
                 self.thread_watch_manager.clone(),
+                Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
                 ApiVersion::V2,
                 "test-provider".to_string(),
                 &self.codex_home,
@@ -3074,7 +3301,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: "/tmp".into(),
+            cwd: test_path_buf("/tmp").abs(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,
@@ -3117,7 +3344,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: "/tmp".into(),
+            cwd: test_path_buf("/tmp").abs(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,
@@ -3356,10 +3583,8 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
@@ -3383,6 +3608,13 @@ mod tests {
             outgoing: outgoing.clone(),
             thread_state: thread_state.clone(),
             thread_watch_manager: thread_watch_manager.clone(),
+            analytics_events_client: AnalyticsEventsClient::new(
+                AuthManager::from_auth_for_testing(
+                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                ),
+                "http://localhost".to_string(),
+                Some(false),
+            ),
             codex_home: codex_home.path().to_path_buf(),
         };
 
@@ -3592,6 +3824,7 @@ mod tests {
         let response = request_permissions_response_from_client_result(
             CoreRequestPermissionProfile::default(),
             Ok(Err(error)),
+            std::env::current_dir().expect("current dir").as_path(),
         );
 
         assert_eq!(response, None);
@@ -3621,10 +3854,10 @@ mod tests {
             network: Some(CoreNetworkPermissions {
                 enabled: Some(true),
             }),
-            file_system: Some(CoreFileSystemPermissions {
-                read: Some(vec![absolute_path(input_path)]),
-                write: Some(vec![absolute_path(output_path)]),
-            }),
+            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                Some(vec![absolute_path(input_path)]),
+                Some(vec![absolute_path(output_path)]),
+            )),
         };
         let cases = vec![
             (
@@ -3651,10 +3884,10 @@ mod tests {
                     },
                 }),
                 CoreRequestPermissionProfile {
-                    file_system: Some(CoreFileSystemPermissions {
-                        read: None,
-                        write: Some(vec![absolute_path(output_path)]),
-                    }),
+                    file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                        /*read*/ None,
+                        Some(vec![absolute_path(output_path)]),
+                    )),
                     ..CoreRequestPermissionProfile::default()
                 },
             ),
@@ -3669,21 +3902,23 @@ mod tests {
                     },
                 }),
                 CoreRequestPermissionProfile {
-                    file_system: Some(CoreFileSystemPermissions {
-                        read: Some(vec![absolute_path(input_path)]),
-                        write: Some(vec![absolute_path(output_path)]),
-                    }),
+                    file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                        Some(vec![absolute_path(input_path)]),
+                        Some(vec![absolute_path(output_path)]),
+                    )),
                     ..CoreRequestPermissionProfile::default()
                 },
             ),
         ];
 
+        let cwd = std::env::current_dir().expect("current dir");
         for (granted_permissions, expected_permissions) in cases {
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
                     "permissions": granted_permissions,
                 }))),
+                cwd.as_path(),
             )
             .expect("response should be accepted");
 
@@ -3692,6 +3927,7 @@ mod tests {
                 CoreRequestPermissionsResponse {
                     permissions: expected_permissions,
                     scope: CorePermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 }
             );
         }
@@ -3705,6 +3941,7 @@ mod tests {
                 "scope": "session",
                 "permissions": {},
             }))),
+            std::env::current_dir().expect("current dir").as_path(),
         )
         .expect("response should be accepted");
 
@@ -3713,7 +3950,184 @@ mod tests {
             CoreRequestPermissionsResponse {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
+                strict_auto_review: false,
             }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_session_scoped_strict_auto_review() {
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": "session",
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            std::env::current_dir().expect("current dir").as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response,
+            CoreRequestPermissionsResponse {
+                permissions: CoreRequestPermissionProfile::default(),
+                scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: false,
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_preserves_turn_scoped_strict_auto_review() {
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile {
+                network: Some(codex_protocol::models::NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            },
+            Ok(Ok(serde_json::json!({
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            std::env::current_dir().expect("current dir").as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(response.scope, CorePermissionGrantScope::Turn);
+        assert!(response.strict_auto_review);
+    }
+
+    #[test]
+    fn request_permissions_response_accepts_explicit_child_grant_for_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [child],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile {
+                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                    /*read*/ None,
+                    Some(vec![child]),
+                )),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_child_grant_outside_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let request_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("request-cwd"))
+            .expect("absolute request cwd");
+        let later_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("later-cwd"))
+            .expect("absolute later cwd");
+        let later_child = later_cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [later_child],
+                    },
+                },
+            }))),
+            request_cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_ignores_broader_cwd_grant_for_requested_child_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![child]),
+            )),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "entries": [{
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": null
+                                }
+                            },
+                            "access": "write"
+                        }],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
         );
     }
 
@@ -3816,23 +4230,26 @@ mod tests {
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                &event_turn_id,
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: event_turn_id.clone(),
                     started_at: Some(42),
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                }),
+            );
+            state.track_current_turn_event(
                 &event_turn_id,
-            )));
+                &EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+            );
         }
 
         handle_turn_complete(
             conversation_id,
             event_turn_id.clone(),
             turn_complete_event(&event_turn_id),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -3881,6 +4298,7 @@ mod tests {
             conversation_id,
             event_turn_id.clone(),
             turn_aborted_event(&event_turn_id),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -3928,6 +4346,7 @@ mod tests {
             conversation_id,
             event_turn_id.clone(),
             turn_complete_event(&event_turn_id),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -4051,6 +4470,7 @@ mod tests {
                 balance: Some("5".to_string()),
             }),
             plan_type: None,
+            rate_limit_reached_type: None,
         };
 
         handle_token_count_event(
@@ -4134,6 +4554,7 @@ mod tests {
                 tool: "list_mcp_resources".to_string(),
                 arguments: Some(serde_json::json!({"server": ""})),
             },
+            mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
         };
 
         let thread_id = ThreadId::new().to_string();
@@ -4154,6 +4575,7 @@ mod tests {
                 tool: begin_event.invocation.tool,
                 status: McpToolCallStatus::InProgress,
                 arguments: serde_json::json!({"server": ""}),
+                mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -4194,6 +4616,7 @@ mod tests {
             conversation_a,
             a_turn1.clone(),
             turn_complete_event(&a_turn1),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -4215,6 +4638,7 @@ mod tests {
             conversation_b,
             b_turn1.clone(),
             turn_complete_event(&b_turn1),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -4226,6 +4650,7 @@ mod tests {
             conversation_a,
             a_turn2.clone(),
             turn_complete_event(&a_turn2),
+            /*analytics_events_client*/ None,
             &outgoing,
             &thread_state,
         )
@@ -4291,6 +4716,7 @@ mod tests {
                 tool: "list_mcp_resources".to_string(),
                 arguments: None,
             },
+            mcp_app_resource_uri: None,
         };
 
         let thread_id = ThreadId::new().to_string();
@@ -4311,6 +4737,7 @@ mod tests {
                 tool: begin_event.invocation.tool,
                 status: McpToolCallStatus::InProgress,
                 arguments: JsonValue::Null,
+                mcp_app_resource_uri: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -4342,6 +4769,7 @@ mod tests {
                 tool: "list_mcp_resources".to_string(),
                 arguments: Some(serde_json::json!({"server": ""})),
             },
+            mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
             duration: Duration::from_nanos(92708),
             result: Ok(result),
         };
@@ -4364,13 +4792,14 @@ mod tests {
                 tool: end_event.invocation.tool,
                 status: McpToolCallStatus::Completed,
                 arguments: serde_json::json!({"server": ""}),
-                result: Some(McpToolCallResult {
+                mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
+                result: Some(Box::new(McpToolCallResult {
                     content,
                     structured_content: None,
                     meta: Some(serde_json::json!({
                         "ui/resourceUri": "ui://widget/list-resources.html"
                     })),
-                }),
+                })),
                 error: None,
                 duration_ms: Some(0),
             },
@@ -4388,6 +4817,7 @@ mod tests {
                 tool: "list_mcp_resources".to_string(),
                 arguments: None,
             },
+            mcp_app_resource_uri: None,
             duration: Duration::from_millis(1),
             result: Err("boom".to_string()),
         };
@@ -4410,6 +4840,7 @@ mod tests {
                 tool: end_event.invocation.tool,
                 status: McpToolCallStatus::Failed,
                 arguments: JsonValue::Null,
+                mcp_app_resource_uri: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: "boom".to_string(),
