@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use codex_windows_sandbox::ElevatedSandboxCaptureRequest;
+    use codex_windows_sandbox::NetworkMode;
     use codex_windows_sandbox::parse_policy;
     use codex_windows_sandbox::run_windows_sandbox_capture_elevated;
     use codex_windows_sandbox::run_windows_sandbox_capture_with_extra_deny_write_paths;
@@ -16,6 +17,11 @@ fn main() -> anyhow::Result<()> {
         Unelevated,
     }
 
+    fn path_eq(left: &std::path::Path, right: &std::path::Path) -> bool {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(right.to_string_lossy().as_ref())
+    }
+
     let mut args = std::env::args().skip(1);
     let mut policy = String::from("read-only");
     let mut backend = Backend::Auto;
@@ -25,11 +31,16 @@ fn main() -> anyhow::Result<()> {
     let mut timeout_ms: Option<u64> = None;
     let mut use_private_desktop = false;
     let mut proxy_enforced = false;
+    let mut network_mode = NetworkMode::Default;
     let mut read_roots: Vec<PathBuf> = Vec::new();
     let mut write_roots: Vec<PathBuf> = Vec::new();
+    let mut deny_read_paths: Vec<PathBuf> = Vec::new();
     let mut deny_write_paths: Vec<PathBuf> = Vec::new();
+    let mut temp_root: Option<PathBuf> = None;
     let mut env_map: HashMap<String, String> = std::env::vars().collect();
     let mut command: Vec<String> = Vec::new();
+    let mut print_capabilities_json = false;
+    let mut print_probe_json = false;
 
     const HELP_TEXT: &str = "\
 codex-windows-sandbox-host - run a command through Windows sandbox setup + runner
@@ -48,6 +59,12 @@ Examples:
 Options:
   -h, --help
       Show this help text.
+
+  --capabilities --json
+      Print passive host capability JSON and exit.
+
+  --probe --json
+      Print host capability JSON. Active probes are not run by this command yet.
 
   --policy <read-only|workspace-write|JSON>
       Sandbox policy preset or raw SandboxPolicy JSON.
@@ -108,6 +125,18 @@ Options:
       Add explicit deny-write paths that remain read-only even under
       workspace-write configurations.
 
+  --deny-read-path <PATH> (repeatable)
+      Add explicit deny-read paths that remain unreadable even under explicit
+      read roots. Supported only by elevated backend.
+
+  --temp-root <PATH>
+      Use PATH as the child TEMP/TMP directory and add it to writable roots.
+      Host TEMP/TMP are not made writable unless they are this same path.
+
+  --network <none|default>
+      Select host network behavior.
+      default follows the sandbox policy. none forces the offline identity.
+
   --env <KEY=VALUE>       (repeatable)
       Set or override one environment variable for the child process.
       By default, the current process environment is inherited first.
@@ -132,6 +161,13 @@ Argument parsing notes:
                 println!("{HELP_TEXT}");
                 return Ok(());
             }
+            "--capabilities" => {
+                print_capabilities_json = true;
+            }
+            "--probe" => {
+                print_probe_json = true;
+            }
+            "--json" => {}
             "--policy" => {
                 policy = args
                     .next()
@@ -184,6 +220,20 @@ Argument parsing notes:
             "--proxy-enforced" => {
                 proxy_enforced = true;
             }
+            "--network" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --network"))?;
+                network_mode = match value.as_str() {
+                    "default" => NetworkMode::Default,
+                    "none" => NetworkMode::None,
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "invalid --network: {value}. Expected none|default"
+                        ));
+                    }
+                };
+            }
             "--read-root" => {
                 read_roots
                     .push(PathBuf::from(args.next().ok_or_else(|| {
@@ -196,10 +246,22 @@ Argument parsing notes:
                         anyhow::anyhow!("missing value for --write-root")
                     })?));
             }
+            "--deny-read-path" => {
+                deny_read_paths
+                    .push(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("missing value for --deny-read-path")
+                    })?));
+            }
             "--deny-write-path" => {
                 deny_write_paths
                     .push(PathBuf::from(args.next().ok_or_else(|| {
                         anyhow::anyhow!("missing value for --deny-write-path")
+                    })?));
+            }
+            "--temp-root" => {
+                temp_root =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("missing value for --temp-root")
                     })?));
             }
             "--env" => {
@@ -222,6 +284,13 @@ Argument parsing notes:
         }
     }
 
+    if print_capabilities_json || print_probe_json {
+        println!(
+            "{{\"version\":1,\"backend\":\"auto\",\"fullSandbox\":true,\"explicitRoots\":true,\"denyRead\":true,\"denyWrite\":true,\"tempRoot\":true,\"networkIsolation\":true,\"jobObjectKillTree\":true,\"clearEnv\":true,\"limitedReasons\":[]}}"
+        );
+        return Ok(());
+    }
+
     if command.is_empty() {
         return Err(anyhow::anyhow!(
             "missing command. Use -- <COMMAND> [ARGS...]"
@@ -239,6 +308,19 @@ Argument parsing notes:
     } else {
         Some(read_roots.as_slice())
     };
+    if let Some(temp_root) = temp_root.as_ref() {
+        std::fs::create_dir_all(temp_root)?;
+        let temp_root = dunce::canonicalize(temp_root).unwrap_or_else(|_| temp_root.clone());
+        env_map.insert("TEMP".to_string(), temp_root.to_string_lossy().to_string());
+        env_map.insert("TMP".to_string(), temp_root.to_string_lossy().to_string());
+        if !write_roots
+            .iter()
+            .any(|root| path_eq(root.as_path(), temp_root.as_path()))
+        {
+            write_roots.push(temp_root);
+        }
+    }
+
     let write_roots_override = if write_roots.is_empty() {
         None
     } else {
@@ -250,13 +332,15 @@ Argument parsing notes:
         Backend::Unelevated => Backend::Unelevated,
         Backend::Auto => {
             let parsed_policy = parse_policy(policy.as_str())?;
-            if proxy_enforced
+            let needs_elevated = proxy_enforced
                 || read_roots_override.is_some()
                 || write_roots_override.is_some()
-                || !parsed_policy.has_full_disk_read_access()
-            {
-                Backend::Elevated
-            } else if sandbox_setup_is_complete(codex_home.as_path()) {
+                || !deny_read_paths.is_empty()
+                || !deny_write_paths.is_empty()
+                || temp_root.is_some()
+                || matches!(network_mode, NetworkMode::None)
+                || !parsed_policy.has_full_disk_read_access();
+            if needs_elevated || sandbox_setup_is_complete(codex_home.as_path()) {
                 Backend::Elevated
             } else {
                 Backend::Unelevated
@@ -275,9 +359,11 @@ Argument parsing notes:
             timeout_ms,
             use_private_desktop,
             proxy_enforced,
+            network_mode,
             read_roots_override,
             read_roots_include_platform_defaults: false,
             write_roots_override,
+            deny_read_paths_override: deny_read_paths.as_slice(),
             deny_write_paths_override: deny_write_paths.as_slice(),
         })?,
         Backend::Unelevated => {
@@ -286,9 +372,14 @@ Argument parsing notes:
                     "--proxy-enforced is only supported with --backend elevated (or auto)"
                 ));
             }
-            if read_roots_override.is_some() || write_roots_override.is_some() {
+            if read_roots_override.is_some()
+                || write_roots_override.is_some()
+                || !deny_read_paths.is_empty()
+                || temp_root.is_some()
+                || matches!(network_mode, NetworkMode::None)
+            {
                 return Err(anyhow::anyhow!(
-                    "--read-root/--write-root overrides are only supported with --backend elevated (or auto)"
+                    "--read-root/--write-root/--deny-read-path/--temp-root/--network none are only supported with --backend elevated (or auto)"
                 ));
             }
             run_windows_sandbox_capture_with_extra_deny_write_paths(

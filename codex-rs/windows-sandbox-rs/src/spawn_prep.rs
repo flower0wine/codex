@@ -17,6 +17,7 @@ use crate::policy::SandboxPolicy;
 use crate::policy::parse_policy;
 use crate::sandbox_utils::ensure_codex_home_exists;
 use crate::sandbox_utils::inject_git_safe_directory;
+use crate::setup::NetworkMode;
 use crate::token::convert_string_sid_to_sid;
 use crate::token::create_readonly_token_with_cap;
 use crate::token::create_workspace_write_token_with_caps_from;
@@ -296,8 +297,10 @@ pub(crate) fn prepare_elevated_spawn_context(
         /*read_roots_override*/ None,
         /*read_roots_include_platform_defaults*/ false,
         write_roots_override,
+        &[],
         &deny_write_paths,
         /*proxy_enforced*/ false,
+        NetworkMode::Default,
     )?;
     let caps = load_or_create_cap_sids(codex_home)?;
     let (psid_to_use, cap_sids) = match &common.policy {

@@ -74,6 +74,8 @@ mod spawn_prep;
 mod session;
 
 #[cfg(target_os = "windows")]
+pub use acl::add_deny_read_ace;
+#[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace;
 
 #[cfg(target_os = "windows")]
@@ -168,6 +170,8 @@ pub use process::spawn_process_with_pipes;
 pub use session::spawn_windows_sandbox_session_elevated;
 #[cfg(target_os = "windows")]
 pub use session::spawn_windows_sandbox_session_legacy;
+#[cfg(target_os = "windows")]
+pub use setup::NetworkMode;
 #[cfg(target_os = "windows")]
 pub use setup::SETUP_VERSION;
 #[cfg(target_os = "windows")]

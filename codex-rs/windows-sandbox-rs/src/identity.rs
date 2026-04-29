@@ -12,6 +12,7 @@ use crate::setup::SandboxNetworkIdentity;
 use crate::setup::SandboxUserRecord;
 use crate::setup::SandboxUsersFile;
 use crate::setup::SetupMarker;
+use crate::setup::NetworkMode;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
@@ -139,8 +140,10 @@ pub fn require_logon_sandbox_creds(
     read_roots_override: Option<&[PathBuf]>,
     read_roots_include_platform_defaults: bool,
     write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
+    network_mode: NetworkMode,
 ) -> Result<SandboxCreds> {
     let sandbox_dir = crate::setup::sandbox_dir(codex_home);
     let needed_read = read_roots_override
@@ -149,7 +152,7 @@ pub fn require_logon_sandbox_creds(
     let needed_write = write_roots_override
         .map(<[PathBuf]>::to_vec)
         .unwrap_or_else(|| gather_write_roots(policy, policy_cwd, command_cwd, env_map));
-    let network_identity = SandboxNetworkIdentity::from_policy(policy, proxy_enforced);
+    let network_identity = SandboxNetworkIdentity::from_policy(policy, proxy_enforced, network_mode);
     let desired_offline_proxy_settings =
         offline_proxy_settings_from_env(env_map, network_identity);
     // NOTE: Do not add CODEX_HOME/.sandbox to `needed_write`; it must remain non-writable by the
@@ -196,11 +199,13 @@ pub fn require_logon_sandbox_creds(
                 env_map,
                 codex_home,
                 proxy_enforced,
+                network_mode,
             },
             crate::setup::SetupRootOverrides {
                 read_roots: Some(needed_read.clone()),
                 read_roots_include_platform_defaults,
                 write_roots: Some(needed_write.clone()),
+                deny_read_paths: Some(deny_read_paths_override.to_vec()),
                 deny_write_paths: Some(deny_write_paths_override.to_vec()),
             },
         )?;
@@ -215,11 +220,13 @@ pub fn require_logon_sandbox_creds(
             env_map,
             codex_home,
             proxy_enforced,
+            network_mode,
         },
         crate::setup::SetupRootOverrides {
             read_roots: Some(needed_read),
             read_roots_include_platform_defaults,
             write_roots: Some(needed_write),
+            deny_read_paths: Some(deny_read_paths_override.to_vec()),
             deny_write_paths: Some(deny_write_paths_override.to_vec()),
         },
     )?;

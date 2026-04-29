@@ -11,6 +11,7 @@ use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
+use codex_windows_sandbox::add_deny_read_ace;
 use codex_windows_sandbox::add_deny_write_ace;
 use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::convert_string_sid_to_sid;
@@ -83,6 +84,8 @@ struct Payload {
     command_cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    #[serde(default)]
+    deny_read_paths: Vec<PathBuf>,
     #[serde(default)]
     deny_write_paths: Vec<PathBuf>,
     proxy_ports: Vec<u16>,
@@ -646,6 +649,36 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
     let mut seen_write_roots: HashSet<PathBuf> = HashSet::new();
     let canonical_command_cwd = canonicalize_path(&payload.command_cwd);
 
+    for path in &payload.deny_read_paths {
+        if !seen_deny_paths.insert(path.clone()) {
+            continue;
+        }
+        if !path.exists() {
+            log_line(
+                log,
+                &format!("deny-read path {} missing; skipping", path.display()),
+            )?;
+            continue;
+        }
+
+        match unsafe { add_deny_read_ace(path, sandbox_group_psid) } {
+            Ok(true) => {
+                log_line(
+                    log,
+                    &format!("applied deny-read ACE to protect {}", path.display()),
+                )?;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                refresh_errors.push(format!("deny-read ACE failed on {}: {err}", path.display()));
+                log_line(
+                    log,
+                    &format!("deny-read ACE failed on {}: {err}", path.display()),
+                )?;
+            }
+        }
+    }
+
     for root in &payload.write_roots {
         if !seen_write_roots.insert(root.clone()) {
             continue;
@@ -760,6 +793,7 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         }
     });
 
+    seen_deny_paths.clear();
     for path in &payload.deny_write_paths {
         if !seen_deny_paths.insert(path.clone()) {
             continue;

@@ -59,7 +59,8 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 - `unelevated`：强制走非管理员 restricted-token 路径。
 - `auto` 选择规则：
   1. 传了 `--proxy-enforced` 时使用 `elevated`；
-  2. 传了 `--read-root` 或 `--write-root` 时使用 `elevated`；
+  2. 传了 `--read-root`、`--write-root`、`--deny-read-path`、`--deny-write-path`、`--temp-root`
+     或 `--network none` 时使用 `elevated`；
   3. 策略需要受限读权限时使用 `elevated`；
   4. 其他情况下，若已存在 setup marker 则使用 `elevated`；
   5. 若 setup 未完成则回退到 `unelevated`。
@@ -113,6 +114,33 @@ codex-windows-sandbox-host [OPTIONS] -- <COMMAND> [ARGS...]
 `--deny-write-path <PATH>`（可重复）
 
 - 额外的拒写路径（即使在 `workspace-write` 下也保持不可写）。
+
+`--deny-read-path <PATH>`（可重复）
+
+- 额外的拒读路径。
+- 拒读优先级高于 `--read-root`。
+- 仅 `elevated` 后端支持。
+
+`--temp-root <PATH>`
+
+- 为本次命令指定隔离临时目录。
+- 子进程的 `TEMP` 和 `TMP` 会指向该路径。
+- 该路径会自动加入可写根目录。
+- 宿主 `%TEMP%` / `%TMP%` 不会因此自动可写，除非它们就是这个路径。
+
+`--network <none|default>`
+
+- `default`：跟随沙盒策略。
+- `none`：强制使用 offline sandbox identity 和出站防火墙阻断。
+- 仅 `elevated` 后端支持。
+
+`--capabilities --json`
+
+- 输出被动能力 JSON 后退出。
+
+`--probe --json`
+
+- 输出能力 JSON 后退出；当前不会运行主动探测场景。
 
 `--env <KEY=VALUE>`（可重复）
 

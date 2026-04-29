@@ -77,6 +77,23 @@ Examples:
   - Supported only by `elevated` backend.
 - `--deny-write-path <PATH>` (repeatable)
   - Optional explicit deny-write subpaths.
+- `--deny-read-path <PATH>` (repeatable)
+  - Optional explicit deny-read subpaths.
+  - Deny-read wins over `--read-root`.
+  - Supported only by `elevated` backend.
+- `--temp-root <PATH>`
+  - Creates/uses an isolated child temp directory.
+  - Sets child `TEMP` and `TMP` to this path.
+  - Adds this path to the writable roots.
+  - Host `%TEMP%` and `%TMP%` are not made writable unless they are the same path.
+- `--network <none|default>`
+  - `default`: follow the sandbox policy.
+  - `none`: force the offline sandbox identity and outbound firewall block.
+  - Supported only by `elevated` backend.
+- `--capabilities --json`
+  - Prints passive capability JSON and exits.
+- `--probe --json`
+  - Prints capability JSON and exits. Active probes are not run by this command yet.
 - `--env <KEY=VALUE>` (repeatable)
   - Add/override child environment variable.
 - `--clear-env`

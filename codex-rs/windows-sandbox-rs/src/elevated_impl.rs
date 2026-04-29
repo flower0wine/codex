@@ -12,9 +12,11 @@ pub struct ElevatedSandboxCaptureRequest<'a> {
     pub timeout_ms: Option<u64>,
     pub use_private_desktop: bool,
     pub proxy_enforced: bool,
+    pub network_mode: crate::NetworkMode,
     pub read_roots_override: Option<&'a [PathBuf]>,
     pub read_roots_include_platform_defaults: bool,
     pub write_roots_override: Option<&'a [PathBuf]>,
+    pub deny_read_paths_override: &'a [PathBuf],
     pub deny_write_paths_override: &'a [PathBuf],
 }
 
@@ -131,9 +133,11 @@ mod windows_impl {
             timeout_ms,
             use_private_desktop,
             proxy_enforced,
+            network_mode,
             read_roots_override,
             read_roots_include_platform_defaults,
             write_roots_override,
+            deny_read_paths_override,
             deny_write_paths_override,
         } = request;
         let policy = parse_policy(policy_json_or_preset)?;
@@ -156,8 +160,10 @@ mod windows_impl {
             read_roots_override,
             read_roots_include_platform_defaults,
             write_roots_override,
+            deny_read_paths_override,
             deny_write_paths_override,
             proxy_enforced,
+            network_mode,
         )?;
         // Build capability SID for ACL grants.
         if matches!(
@@ -230,11 +236,13 @@ mod windows_impl {
                                 env_map: &env_map,
                                 codex_home,
                                 proxy_enforced,
+                                network_mode,
                             },
                             SetupRootOverrides {
                                 read_roots: read_roots_override.map(<[PathBuf]>::to_vec),
                                 read_roots_include_platform_defaults,
                                 write_roots: write_roots_override.map(<[PathBuf]>::to_vec),
+                                deny_read_paths: Some(deny_read_paths_override.to_vec()),
                                 deny_write_paths: Some(deny_write_paths_override.to_vec()),
                             },
                         )?;
@@ -247,8 +255,10 @@ mod windows_impl {
                             read_roots_override,
                             read_roots_include_platform_defaults,
                             write_roots_override,
+                            deny_read_paths_override,
                             deny_write_paths_override,
                             proxy_enforced,
+                            network_mode,
                         )?;
                         retried_after_credential_failure = true;
                     }

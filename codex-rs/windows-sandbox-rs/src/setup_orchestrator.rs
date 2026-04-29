@@ -89,6 +89,7 @@ pub struct SandboxSetupRequest<'a> {
     pub env_map: &'a HashMap<String, String>,
     pub codex_home: &'a Path,
     pub proxy_enforced: bool,
+    pub network_mode: NetworkMode,
 }
 
 #[derive(Default)]
@@ -96,7 +97,15 @@ pub struct SetupRootOverrides {
     pub read_roots: Option<Vec<PathBuf>>,
     pub read_roots_include_platform_defaults: bool,
     pub write_roots: Option<Vec<PathBuf>>,
+    pub deny_read_paths: Option<Vec<PathBuf>>,
     pub deny_write_paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NetworkMode {
+    #[default]
+    Default,
+    None,
 }
 
 pub fn run_setup_refresh(
@@ -115,6 +124,7 @@ pub fn run_setup_refresh(
             env_map,
             codex_home,
             proxy_enforced,
+            network_mode: NetworkMode::Default,
         },
         SetupRootOverrides::default(),
     )
@@ -146,11 +156,13 @@ pub fn run_setup_refresh_with_extra_read_roots(
             env_map,
             codex_home,
             proxy_enforced,
+            network_mode: NetworkMode::Default,
         },
         SetupRootOverrides {
             read_roots: Some(read_roots),
             read_roots_include_platform_defaults: false,
             write_roots: Some(Vec::new()),
+            deny_read_paths: None,
             deny_write_paths: None,
         },
     )
@@ -168,9 +180,13 @@ fn run_setup_refresh_inner(
         return Ok(());
     }
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
+    let deny_read_paths = normalize_existing_or_literal_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
-    let network_identity =
-        SandboxNetworkIdentity::from_policy(request.policy, request.proxy_enforced);
+    let network_identity = SandboxNetworkIdentity::from_policy(
+        request.policy,
+        request.proxy_enforced,
+        request.network_mode,
+    );
     let offline_proxy_settings = offline_proxy_settings_from_env(request.env_map, network_identity);
     let payload = ElevationPayload {
         version: SETUP_VERSION,
@@ -180,6 +196,7 @@ fn run_setup_refresh_inner(
         command_cwd: request.command_cwd.to_path_buf(),
         read_roots,
         write_roots,
+        deny_read_paths,
         deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
@@ -417,6 +434,8 @@ struct ElevationPayload {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     #[serde(default)]
+    deny_read_paths: Vec<PathBuf>,
+    #[serde(default)]
     deny_write_paths: Vec<PathBuf>,
     proxy_ports: Vec<u16>,
     #[serde(default)]
@@ -439,8 +458,15 @@ pub(crate) enum SandboxNetworkIdentity {
 }
 
 impl SandboxNetworkIdentity {
-    pub(crate) fn from_policy(policy: &SandboxPolicy, proxy_enforced: bool) -> Self {
-        if proxy_enforced || !policy.has_full_network_access() {
+    pub(crate) fn from_policy(
+        policy: &SandboxPolicy,
+        proxy_enforced: bool,
+        network_mode: NetworkMode,
+    ) -> Self {
+        if proxy_enforced
+            || matches!(network_mode, NetworkMode::None)
+            || !policy.has_full_network_access()
+        {
             Self::Offline
         } else {
             Self::Online
@@ -718,9 +744,13 @@ pub fn run_elevated_setup(
         )
     })?;
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
+    let deny_read_paths = normalize_existing_or_literal_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
-    let network_identity =
-        SandboxNetworkIdentity::from_policy(request.policy, request.proxy_enforced);
+    let network_identity = SandboxNetworkIdentity::from_policy(
+        request.policy,
+        request.proxy_enforced,
+        request.network_mode,
+    );
     let offline_proxy_settings = offline_proxy_settings_from_env(request.env_map, network_identity);
     let payload = ElevationPayload {
         version: SETUP_VERSION,
@@ -730,6 +760,7 @@ pub fn run_elevated_setup(
         command_cwd: request.command_cwd.to_path_buf(),
         read_roots,
         write_roots,
+        deny_read_paths,
         deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
@@ -799,7 +830,14 @@ fn build_payload_deny_write_paths(
         request.command_cwd,
         request.env_map,
     );
-    let mut deny_write_paths: Vec<PathBuf> = explicit_deny_write_paths
+    let mut deny_write_paths: Vec<PathBuf> =
+        normalize_existing_or_literal_paths(explicit_deny_write_paths);
+    deny_write_paths.extend(allow_deny_paths.deny);
+    deny_write_paths
+}
+
+fn normalize_existing_or_literal_paths(paths: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
+    paths
         .unwrap_or_default()
         .into_iter()
         .map(|path| {
@@ -809,9 +847,7 @@ fn build_payload_deny_write_paths(
                 path
             }
         })
-        .collect();
-    deny_write_paths.extend(allow_deny_paths.deny);
-    deny_write_paths
+        .collect()
 }
 
 fn expand_user_profile_root(roots: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1319,11 +1355,13 @@ mod tests {
                 env_map: &HashMap::new(),
                 codex_home: &codex_home,
                 proxy_enforced: false,
+                network_mode: super::NetworkMode::Default,
             },
             &super::SetupRootOverrides {
                 read_roots: Some(vec![readable_root.clone()]),
                 read_roots_include_platform_defaults: true,
                 write_roots: None,
+                deny_read_paths: None,
                 deny_write_paths: None,
             },
         );
@@ -1366,11 +1404,13 @@ mod tests {
                 env_map: &HashMap::new(),
                 codex_home: &codex_home,
                 proxy_enforced: false,
+                network_mode: super::NetworkMode::Default,
             },
             &super::SetupRootOverrides {
                 read_roots: Some(vec![readable_root.clone()]),
                 read_roots_include_platform_defaults: false,
                 write_roots: None,
+                deny_read_paths: None,
                 deny_write_paths: None,
             },
         );
@@ -1418,6 +1458,7 @@ mod tests {
             env_map: &HashMap::new(),
             codex_home: &codex_home,
             proxy_enforced: false,
+            network_mode: super::NetworkMode::Default,
         };
 
         let deny_write_paths =

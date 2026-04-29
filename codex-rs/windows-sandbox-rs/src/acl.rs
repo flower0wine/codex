@@ -40,6 +40,9 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_EA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
@@ -214,57 +217,22 @@ pub unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) 
     false
 }
 
-pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-    if p_dacl.is_null() {
-        return false;
-    }
-    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-    let ok = GetAclInformation(
-        p_dacl as *const ACL,
-        &mut info as *mut _ as *mut c_void,
-        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-        AclSizeInformation,
-    );
-    if ok == 0 {
-        return false;
-    }
-    let deny_write_mask = FILE_GENERIC_WRITE
-        | FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | GENERIC_WRITE_MASK
-        | DELETE
-        | FILE_DELETE_CHILD;
-    for i in 0..info.AceCount {
-        let mut p_ace: *mut c_void = std::ptr::null_mut();
-        if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
-            continue;
-        }
-        let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != 1 {
-            continue; // ACCESS_DENIED_ACE_TYPE
-        }
-        if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
-            continue;
-        }
-        let ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
-        let base = p_ace as usize;
-        let sid_ptr =
-            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_write_mask) != 0 {
-            return true;
-        }
-    }
-    false
-}
-
 const WRITE_ALLOW_MASK: u32 = FILE_GENERIC_READ
     | FILE_GENERIC_WRITE
     | FILE_GENERIC_EXECUTE
     | DELETE
     | FILE_DELETE_CHILD;
 
+const READ_DENY_MASK: u32 = FILE_GENERIC_READ | FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES;
+
+const WRITE_DENY_MASK: u32 = FILE_GENERIC_WRITE
+    | FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | GENERIC_WRITE_MASK
+    | DELETE
+    | FILE_DELETE_CHILD;
 
 unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     path: &Path,
@@ -449,11 +417,48 @@ pub unsafe fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
     Ok(added)
 }
 
-/// Adds a deny ACE to prevent write/append/delete for the given SID on the target path.
+unsafe fn dacl_has_deny_mask_for_sid(p_dacl: *mut ACL, psid: *mut c_void, deny_mask: u32) -> bool {
+    if p_dacl.is_null() {
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = GetAclInformation(
+        p_dacl as *const ACL,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    );
+    if ok == 0 {
+        return false;
+    }
+    for i in 0..info.AceCount {
+        let mut p_ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
+            continue;
+        }
+        let hdr = &*(p_ace as *const ACE_HEADER);
+        if hdr.AceType != 1 {
+            continue; // ACCESS_DENIED_ACE_TYPE
+        }
+        if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let ace = &*(p_ace as *const ACCESS_ALLOWED_ACE);
+        let base = p_ace as usize;
+        let sid_ptr =
+            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
+        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_mask) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Adds a deny ACE with `deny_mask` for the given SID on the target path.
 ///
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
-pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+unsafe fn add_deny_mask_ace(path: &Path, psid: *mut c_void, deny_mask: u32) -> Result<bool> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -470,7 +475,7 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
         return Err(anyhow!("GetNamedSecurityInfoW failed: {code}"));
     }
     let mut added = false;
-    if !dacl_has_write_deny_for_sid(p_dacl, psid) {
+    if !dacl_has_deny_mask_for_sid(p_dacl, psid, deny_mask) {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -479,14 +484,7 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
             ptstrName: psid as *mut u16,
         };
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions = FILE_GENERIC_WRITE
-            | FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_EA
-            | FILE_WRITE_ATTRIBUTES
-            | GENERIC_WRITE_MASK
-            | DELETE
-            | FILE_DELETE_CHILD;
+        explicit.grfAccessPermissions = deny_mask;
         explicit.grfAccessMode = DENY_ACCESS;
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         explicit.Trustee = trustee;
@@ -514,6 +512,22 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
         LocalFree(p_sd as HLOCAL);
     }
     Ok(added)
+}
+
+/// Adds a deny ACE to prevent read for the given SID on the target path.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_deny_mask_ace(path, psid, READ_DENY_MASK)
+}
+
+/// Adds a deny ACE to prevent write/append/delete for the given SID on the target path.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_deny_mask_ace(path, psid, WRITE_DENY_MASK)
 }
 
 pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
