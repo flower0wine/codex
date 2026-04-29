@@ -933,6 +933,7 @@ impl RequestUserInputOverlay {
             | InputResult::Queued {
                 text,
                 text_elements,
+                ..
             } => {
                 if self.has_options()
                     && matches!(self.focus, Focus::Notes)
@@ -1237,6 +1238,10 @@ impl BottomPaneView for RequestUserInputOverlay {
                 }
             }
         }
+    }
+
+    fn terminal_title_requires_action(&self) -> bool {
+        true
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {

@@ -8,11 +8,15 @@ use codex_core::config::Config;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_MCP_APP_RESOURCE_URI;
@@ -39,7 +43,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 const SEARCH_TOOL_DESCRIPTION_SNIPPETS: [&str; 2] = [
-    "You have access to tools from the following MCP servers/connectors",
+    "You have access to tools from the following sources",
     "- Calendar: Plan events and manage your calendar.",
 ];
 const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
@@ -94,23 +98,26 @@ fn tool_search_output_tools(request: &ResponsesRequest, call_id: &str) -> Vec<Va
         .unwrap_or_default()
 }
 
+fn configure_search_capable_model(config: &mut Config) {
+    let mut model_catalog = bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+    let model = model_catalog
+        .models
+        .iter_mut()
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("gpt-5.4 exists in bundled models.json");
+    config.model = Some("gpt-5.4".to_string());
+    model.supports_search_tool = true;
+    config.model_catalog = Some(model_catalog);
+}
+
 fn configure_search_capable_apps(config: &mut Config, apps_base_url: &str) {
     config
         .features
         .enable(Feature::Apps)
         .expect("test config should allow feature update");
     config.chatgpt_base_url = apps_base_url.to_string();
-    config.model = Some("gpt-5-codex".to_string());
-
-    let mut model_catalog = bundled_models_response()
-        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
-    let model = model_catalog
-        .models
-        .iter_mut()
-        .find(|model| model.slug == "gpt-5-codex")
-        .expect("gpt-5-codex exists in bundled models.json");
-    model.supports_search_tool = true;
-    config.model_catalog = Some(model_catalog);
+    configure_search_capable_model(config);
 }
 
 fn configure_apps_without_tool_search(config: &mut Config, apps_base_url: &str) {
@@ -150,10 +157,10 @@ async fn search_tool_enabled_by_default_adds_tool_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -177,13 +184,59 @@ async fn search_tool_enabled_by_default_adds_tool_search() -> Result<()> {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query for MCP tools."},
+                    "query": {"type": "string", "description": "Search query for deferred tools."},
                     "limit": {"type": "number", "description": "Maximum number of tools to return (defaults to 8)."},
                 },
                 "required": ["query"],
                 "additionalProperties": false,
             }
         })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_defer_feature_hides_small_app_tool_sets() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder =
+        configured_builder(apps_server.chatgpt_base_url.clone()).with_config(|config| {
+            config
+                .features
+                .enable(Feature::ToolSearchAlwaysDeferMcpTools)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn_with_approval_and_permission_profile(
+        "list tools",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let body = mock.single_request().body_json();
+    let tools = tool_names(&body);
+    assert!(
+        tools.iter().any(|name| name == TOOL_SEARCH_TOOL_NAME),
+        "small app tool sets should be deferred behind tool_search: {tools:?}"
+    );
+    assert!(
+        tools.iter().all(|name| !name.starts_with("mcp__")),
+        "MCP tools should not be directly exposed: {tools:?}"
     );
 
     Ok(())
@@ -212,10 +265,10 @@ async fn tool_search_disabled_exposes_apps_tools_directly() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -258,10 +311,10 @@ async fn search_tool_is_hidden_for_api_key_auth() -> Result<()> {
         .with_config(move |config| configure_apps(config, apps_server.chatgpt_base_url.as_str()));
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -294,10 +347,10 @@ async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -336,10 +389,10 @@ async fn search_tool_hides_apps_tools_without_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "hello tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -372,10 +425,10 @@ async fn explicit_app_mentions_expose_apps_tools_without_search() -> Result<()> 
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "Use [$calendar](app://calendar) and then call tools.",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -449,6 +502,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     let test = builder.build(&server).await?;
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "Find the calendar create tool".to_string(),
                 text_elements: Vec::new(),
@@ -501,6 +555,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .structured_content,
         Some(json!({
             "_codex_apps": {
+                "call_id": "calendar-call-1",
                 "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
                 "contains_mcp_source": true,
                 "connector_id": "calendar",
@@ -532,6 +587,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     assert_eq!(
         apps_tool_call.pointer("/params/_meta/_codex_apps"),
         Some(&json!({
+            "call_id": "calendar-call-1",
             "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
             "contains_mcp_source": true,
             "connector_id": "calendar",
@@ -548,8 +604,30 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .is_some_and(|turn_id| !turn_id.is_empty()),
         "apps tools/call should include turn metadata turn_id: {apps_tool_call:?}"
     );
+    let mcp_turn_started_at_unix_ms = apps_tool_call
+        .pointer("/params/_meta/x-codex-turn-metadata/turn_started_at_unix_ms")
+        .and_then(Value::as_i64)
+        .expect("apps tools/call should include turn_started_at_unix_ms");
+    assert!(
+        mcp_turn_started_at_unix_ms > 0,
+        "apps tools/call should include a positive turn_started_at_unix_ms: {apps_tool_call:?}"
+    );
 
-    let first_request_tools = tool_names(&requests[0].body_json());
+    let first_request_turn_metadata: Value = serde_json::from_str(
+        &requests[0]
+            .header("x-codex-turn-metadata")
+            .expect("first response request should include turn metadata"),
+    )
+    .expect("first response request turn metadata should be valid JSON");
+    assert_eq!(
+        first_request_turn_metadata
+            .get("turn_started_at_unix_ms")
+            .and_then(Value::as_i64),
+        Some(mcp_turn_started_at_unix_ms)
+    );
+
+    let first_request_body = requests[0].body_json();
+    let first_request_tools = tool_names(&first_request_body);
     assert!(
         first_request_tools
             .iter()
@@ -646,6 +724,187 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let search_call_id = "tool-search-1";
+    let dynamic_call_id = "dyn-search-call-1";
+    let tool_name = "automation_update";
+    let tool_description = "Create, update, view, or delete recurring automations.";
+    let tool_args = json!({ "mode": "create" });
+    let tool_call_arguments = serde_json::to_string(&tool_args)?;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_tool_search_call(
+                    search_call_id,
+                    &json!({
+                        "query": "recurring automations",
+                        "limit": 8,
+                    }),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": dynamic_call_id,
+                        "namespace": "codex_app",
+                        "name": tool_name,
+                        "arguments": tool_call_arguments,
+                    }
+                }),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let input_schema = json!({
+        "type": "object",
+        "properties": {
+            "mode": { "type": "string" },
+        },
+        "required": ["mode"],
+        "additionalProperties": false,
+    });
+    let dynamic_tool = DynamicToolSpec {
+        namespace: Some("codex_app".to_string()),
+        name: tool_name.to_string(),
+        description: tool_description.to_string(),
+        input_schema: input_schema.clone(),
+        defer_loading: true,
+    };
+
+    let mut builder = test_codex().with_config(configure_search_capable_model);
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(
+            base_test.config.clone(),
+            vec![dynamic_tool],
+            /*persist_extended_history*/ false,
+        )
+        .await?;
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    test.codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "Use the automation tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+
+    let EventMsg::DynamicToolCallRequest(request) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(_))
+    })
+    .await
+    else {
+        unreachable!("event guard guarantees DynamicToolCallRequest");
+    };
+    assert_eq!(request.call_id, dynamic_call_id);
+    assert_eq!(request.namespace.as_deref(), Some("codex_app"));
+    assert_eq!(request.tool, tool_name);
+    assert_eq!(request.arguments, tool_args);
+
+    test.codex
+        .submit(Op::DynamicToolResponse {
+            id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "dynamic-search-ok".to_string(),
+                }],
+                success: true,
+            },
+        })
+        .await?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+
+    let first_request_body = requests[0].body_json();
+    let first_request_tools = tool_names(&first_request_body);
+    assert!(
+        first_request_tools
+            .iter()
+            .any(|name| name == TOOL_SEARCH_TOOL_NAME),
+        "first request should advertise tool_search: {first_request_tools:?}"
+    );
+    assert!(
+        !first_request_tools.iter().any(|name| name == tool_name),
+        "deferred dynamic tool should be hidden before search: {first_request_tools:?}"
+    );
+
+    let tools = tool_search_output_tools(&requests[1], search_call_id);
+    assert_eq!(
+        tools,
+        vec![json!({
+            "type": "namespace",
+            "name": "codex_app",
+            "description": "Tools in the codex_app namespace.",
+            "tools": [{
+                "type": "function",
+                "name": tool_name,
+                "description": tool_description,
+                "strict": false,
+                "defer_loading": true,
+                "parameters": input_schema,
+            }],
+        })]
+    );
+
+    let second_request_body = requests[1].body_json();
+    let second_request_tools = tool_names(&second_request_body);
+    assert!(
+        !second_request_tools.iter().any(|name| name == tool_name),
+        "follow-up request should rely on tool_search_output history, not tool injection: {second_request_tools:?}"
+    );
+
+    let output = requests[2]
+        .function_call_output(dynamic_call_id)
+        .get("output")
+        .cloned()
+        .expect("dynamic tool output should be present");
+    let payload: FunctionCallOutputPayload = serde_json::from_value(output)?;
+    assert_eq!(
+        payload,
+        FunctionCallOutputPayload::from_text("dynamic-search-ok".to_string())
+    );
+
+    let third_request_body = requests[2].body_json();
+    let third_request_tools = tool_names(&third_request_body);
+    assert!(
+        !third_request_tools.iter().any(|name| name == tool_name),
+        "post-tool follow-up should rely on tool_search_output history, not tool injection: {third_request_tools:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -719,10 +978,10 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "Find the rmcp echo and image tools.",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 

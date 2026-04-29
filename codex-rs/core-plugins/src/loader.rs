@@ -1,3 +1,5 @@
+use crate::OPENAI_CURATED_MARKETPLACE_NAME;
+use crate::manifest::PluginManifestHooks;
 use crate::manifest::PluginManifestPaths;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace::MarketplacePluginSource;
@@ -6,6 +8,7 @@ use crate::marketplace::load_marketplace;
 use crate::store::PluginStore;
 use crate::store::plugin_version_for_source;
 use codex_config::ConfigLayerStack;
+use codex_config::HooksFile;
 use codex_config::types::McpServerConfig;
 use codex_config::types::PluginConfig;
 use codex_core_skills::SkillMetadata;
@@ -18,6 +21,7 @@ use codex_exec_server::LOCAL_FS;
 use codex_plugin::AppConnectorId;
 use codex_plugin::LoadedPlugin;
 use codex_plugin::PluginCapabilitySummary;
+use codex_plugin::PluginHookSource;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
 use codex_plugin::PluginLoadOutcome;
@@ -25,6 +29,7 @@ use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_plugins::find_plugin_manifest_path;
 use serde::Deserialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
@@ -32,14 +37,17 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
+use tempfile::TempDir;
 use tracing::warn;
 
 const DEFAULT_SKILLS_DIR_NAME: &str = "skills";
+const DEFAULT_HOOKS_CONFIG_FILE: &str = "hooks/hooks.json";
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
 const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
-const OPENAI_CURATED_MARKETPLACE_NAME: &str = "openai-curated";
 const CONFIG_TOML_FILE: &str = "config.toml";
+const CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NonCuratedCacheRefreshMode {
@@ -65,9 +73,24 @@ pub fn log_plugin_load_errors(outcome: &PluginLoadOutcome<McpServerConfig>) {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PluginMcpFile {
-    #[serde(default)]
+struct PluginMcpServersFile {
     mcp_servers: HashMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PluginMcpFile {
+    McpServersObject(PluginMcpServersFile),
+    ServerMap(HashMap<String, JsonValue>),
+}
+
+impl PluginMcpFile {
+    fn into_mcp_servers(self) -> HashMap<String, JsonValue> {
+        match self {
+            Self::McpServersObject(file) => file.mcp_servers,
+            Self::ServerMap(mcp_servers) => mcp_servers,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -127,7 +150,8 @@ pub fn refresh_curated_plugin_cache(
     plugin_version: &str,
     configured_curated_plugin_ids: &[PluginId],
 ) -> Result<bool, String> {
-    let store = PluginStore::new(codex_home.to_path_buf());
+    let cache_plugin_version = curated_plugin_cache_version(plugin_version);
+    let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
     let curated_marketplace_path = AbsolutePathBuf::try_from(
         codex_home
             .join(".tmp/plugins")
@@ -150,13 +174,22 @@ pub fn refresh_curated_plugin_cache(
         }
         let source_path = match plugin.source {
             MarketplacePluginSource::Local { path } => path,
+            MarketplacePluginSource::Git { .. } => {
+                warn!(
+                    plugin = plugin_name,
+                    marketplace = OPENAI_CURATED_MARKETPLACE_NAME,
+                    "skipping remote curated plugin source during cache refresh"
+                );
+                continue;
+            }
         };
         plugin_sources.insert(plugin_name, source_path);
     }
 
     let mut cache_refreshed = false;
     for plugin_id in configured_curated_plugin_ids {
-        if store.active_plugin_version(plugin_id).as_deref() == Some(plugin_version) {
+        if store.active_plugin_version(plugin_id).as_deref() == Some(cache_plugin_version.as_str())
+        {
             continue;
         }
 
@@ -170,7 +203,7 @@ pub fn refresh_curated_plugin_cache(
         };
 
         store
-            .install_with_version(source_path, plugin_id.clone(), plugin_version.to_string())
+            .install_with_version(source_path, plugin_id.clone(), cache_plugin_version.clone())
             .map_err(|err| {
                 format!(
                     "failed to refresh curated plugin cache for {}: {err}",
@@ -181,6 +214,14 @@ pub fn refresh_curated_plugin_cache(
     }
 
     Ok(cache_refreshed)
+}
+
+pub fn curated_plugin_cache_version(plugin_version: &str) -> String {
+    if is_full_git_sha(plugin_version) {
+        plugin_version[..CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN].to_string()
+    } else {
+        plugin_version.to_string()
+    }
 }
 
 pub fn refresh_non_curated_plugin_cache(
@@ -224,10 +265,10 @@ fn refresh_non_curated_plugin_cache_with_mode(
         .map(PluginId::as_key)
         .collect::<HashSet<_>>();
 
-    let store = PluginStore::new(codex_home.to_path_buf());
+    let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
     let marketplace_outcome = list_marketplaces(additional_roots)
         .map_err(|err| format!("failed to discover marketplaces for cache refresh: {err}"))?;
-    let mut plugin_sources = HashMap::<String, (AbsolutePathBuf, String)>::new();
+    let mut plugin_sources = HashMap::<String, MarketplacePluginSource>::new();
 
     for marketplace in marketplace_outcome.marketplaces {
         if marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME {
@@ -256,19 +297,14 @@ fn refresh_non_curated_plugin_cache_with_mode(
                 continue;
             }
 
-            let source_path = match plugin.source {
-                MarketplacePluginSource::Local { path } => path,
-            };
-            let plugin_version = plugin_version_for_source(source_path.as_path())
-                .map_err(|err| format!("failed to read plugin version for {plugin_key}: {err}"))?;
-            plugin_sources.insert(plugin_key, (source_path, plugin_version));
+            plugin_sources.insert(plugin_key, plugin.source);
         }
     }
 
     let mut cache_refreshed = false;
     for plugin_id in configured_non_curated_plugin_ids {
         let plugin_key = plugin_id.as_key();
-        let Some((source_path, plugin_version)) = plugin_sources.get(&plugin_key).cloned() else {
+        let Some(source) = plugin_sources.get(&plugin_key).cloned() else {
             warn!(
                 plugin = plugin_id.plugin_name,
                 marketplace = plugin_id.marketplace_name,
@@ -276,6 +312,13 @@ fn refresh_non_curated_plugin_cache_with_mode(
             );
             continue;
         };
+        let materialized =
+            materialize_marketplace_plugin_source(codex_home, &source).map_err(|err| {
+                format!("failed to materialize plugin source for {plugin_key}: {err}")
+            })?;
+        let source_path = materialized.path.clone();
+        let plugin_version = plugin_version_for_source(source_path.as_path())
+            .map_err(|err| format!("failed to read plugin version for {plugin_key}: {err}"))?;
 
         if mode == NonCuratedCacheRefreshMode::IfVersionChanged
             && store.active_plugin_version(&plugin_id).as_deref() == Some(plugin_version.as_str())
@@ -299,6 +342,10 @@ fn configured_plugins_from_stack(
         return HashMap::new();
     };
     configured_plugins_from_user_config_value(&user_layer.config)
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn configured_plugins_from_user_config_value(
@@ -435,6 +482,8 @@ async fn load_plugin(
         has_enabled_skills: false,
         mcp_servers: HashMap::new(),
         apps: Vec::new(),
+        hook_sources: Vec::new(),
+        hook_load_warnings: Vec::new(),
         error: None,
     };
 
@@ -442,14 +491,14 @@ async fn load_plugin(
         return loaded_plugin;
     }
 
-    let plugin_root = match plugin_id {
-        Ok(_) => match active_plugin_root {
-            Some(plugin_root) => plugin_root,
-            None => {
+    let (loaded_plugin_id, plugin_root) = match plugin_id {
+        Ok(plugin_id) => {
+            let Some(plugin_root) = active_plugin_root else {
                 loaded_plugin.error = Some("plugin is not installed".to_string());
                 return loaded_plugin;
-            }
-        },
+            };
+            (plugin_id, plugin_root)
+        }
         Err(err) => {
             loaded_plugin.error = Some(err.to_string());
             return loaded_plugin;
@@ -503,6 +552,14 @@ async fn load_plugin(
     }
     loaded_plugin.mcp_servers = mcp_servers;
     loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
+    let (hook_sources, hook_load_warnings) = load_plugin_hooks(
+        &plugin_root,
+        &loaded_plugin_id,
+        &store.plugin_data_root(&loaded_plugin_id),
+        manifest_paths,
+    );
+    loaded_plugin.hook_sources = hook_sources;
+    loaded_plugin.hook_load_warnings = hook_load_warnings;
     loaded_plugin
 }
 
@@ -632,6 +689,116 @@ fn default_app_config_paths(plugin_root: &Path) -> Vec<AbsolutePathBuf> {
     paths
 }
 
+// Discover plugin-bundled hooks from manifest `hooks` entries when present
+// (path, paths, inline object, or inline objects), otherwise from the default
+// `hooks/hooks.json` file.
+pub fn load_plugin_hooks(
+    plugin_root: &AbsolutePathBuf,
+    plugin_id: &PluginId,
+    plugin_data_root: &AbsolutePathBuf,
+    manifest_paths: &PluginManifestPaths,
+) -> (Vec<PluginHookSource>, Vec<String>) {
+    let mut sources = Vec::new();
+    let mut warnings = Vec::new();
+    match &manifest_paths.hooks {
+        Some(PluginManifestHooks::Paths(paths)) => {
+            for path in paths {
+                append_plugin_hook_file(
+                    plugin_root,
+                    plugin_id,
+                    plugin_data_root,
+                    path,
+                    &mut sources,
+                    &mut warnings,
+                );
+            }
+        }
+        Some(PluginManifestHooks::Inline(hooks_files)) => {
+            let manifest_path = find_plugin_manifest_path(plugin_root.as_path())
+                .and_then(|path| AbsolutePathBuf::try_from(path).ok())
+                .unwrap_or_else(|| plugin_root.join(".codex-plugin/plugin.json"));
+            for (index, hooks_file) in hooks_files.iter().enumerate() {
+                if hooks_file.hooks.is_empty() {
+                    continue;
+                }
+                sources.push(PluginHookSource {
+                    plugin_id: plugin_id.clone(),
+                    plugin_root: plugin_root.clone(),
+                    plugin_data_root: plugin_data_root.clone(),
+                    source_path: manifest_path.clone(),
+                    source_relative_path: format!("plugin.json#hooks[{index}]"),
+                    hooks: hooks_file.hooks.clone(),
+                });
+            }
+        }
+        None => {
+            let default_path = plugin_root.join(DEFAULT_HOOKS_CONFIG_FILE);
+            if default_path.as_path().is_file() {
+                append_plugin_hook_file(
+                    plugin_root,
+                    plugin_id,
+                    plugin_data_root,
+                    &default_path,
+                    &mut sources,
+                    &mut warnings,
+                );
+            }
+        }
+    }
+    (sources, warnings)
+}
+
+// Append one resolved plugin hook file, keeping source metadata for runtime
+// reporting and collecting load warnings for startup surfacing.
+fn append_plugin_hook_file(
+    plugin_root: &AbsolutePathBuf,
+    plugin_id: &PluginId,
+    plugin_data_root: &AbsolutePathBuf,
+    path: &AbsolutePathBuf,
+    sources: &mut Vec<PluginHookSource>,
+    warnings: &mut Vec<String>,
+) {
+    let contents = match fs::read_to_string(path.as_path()) {
+        Ok(contents) => contents,
+        Err(err) => {
+            warnings.push(format!(
+                "failed to read plugin hooks config {}: {err}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let parsed = match serde_json::from_str::<HooksFile>(&contents) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warnings.push(format!(
+                "failed to parse plugin hooks config {}: {err}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if parsed.hooks.is_empty() {
+        return;
+    }
+
+    let source_relative_path = path
+        .as_path()
+        .strip_prefix(plugin_root.as_path())
+        .unwrap_or(path.as_path())
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    sources.push(PluginHookSource {
+        plugin_id: plugin_id.clone(),
+        plugin_root: plugin_root.clone(),
+        plugin_data_root: plugin_data_root.clone(),
+        source_path: path.clone(),
+        source_relative_path,
+        hooks: parsed.hooks,
+    });
+}
+
 async fn load_apps_from_paths(
     plugin_root: &Path,
     app_config_paths: Vec<AbsolutePathBuf>,
@@ -730,7 +897,13 @@ pub async fn installed_plugin_telemetry_metadata(
     codex_home: &Path,
     plugin_id: &PluginId,
 ) -> PluginTelemetryMetadata {
-    let store = PluginStore::new(codex_home.to_path_buf());
+    let store = match PluginStore::try_new(codex_home.to_path_buf()) {
+        Ok(store) => store,
+        Err(err) => {
+            warn!("failed to resolve plugin cache root: {err}");
+            return PluginTelemetryMetadata::from_plugin_id(plugin_id);
+        }
+    };
     let Some(plugin_root) = store.active_plugin_root(plugin_id) else {
         return PluginTelemetryMetadata::from_plugin_id(plugin_id);
     };
@@ -757,7 +930,7 @@ async fn load_mcp_servers_from_file(
     };
     normalize_plugin_mcp_servers(
         plugin_root,
-        parsed.mcp_servers,
+        parsed.into_mcp_servers(),
         mcp_config_path.to_string_lossy().as_ref(),
     )
 }
@@ -836,3 +1009,135 @@ fn normalize_plugin_mcp_server_value(
 struct PluginMcpDiscovery {
     mcp_servers: HashMap<String, McpServerConfig>,
 }
+
+#[derive(Debug)]
+pub struct MaterializedMarketplacePluginSource {
+    pub path: AbsolutePathBuf,
+    _tempdir: Option<TempDir>,
+}
+
+pub fn materialize_marketplace_plugin_source(
+    codex_home: &Path,
+    source: &MarketplacePluginSource,
+) -> Result<MaterializedMarketplacePluginSource, String> {
+    match source {
+        MarketplacePluginSource::Local { path } => Ok(MaterializedMarketplacePluginSource {
+            path: path.clone(),
+            _tempdir: None,
+        }),
+        MarketplacePluginSource::Git {
+            url,
+            path,
+            ref_name,
+            sha,
+        } => {
+            let staging_root = codex_home.join("plugins/.marketplace-plugin-source-staging");
+            fs::create_dir_all(&staging_root).map_err(|err| {
+                format!(
+                    "failed to create marketplace plugin source staging directory {}: {err}",
+                    staging_root.display()
+                )
+            })?;
+            let tempdir = tempfile::Builder::new()
+                .prefix("marketplace-plugin-source-")
+                .tempdir_in(&staging_root)
+                .map_err(|err| {
+                    format!(
+                        "failed to create marketplace plugin source staging directory in {}: {err}",
+                        staging_root.display()
+                    )
+                })?;
+            clone_git_plugin_source(
+                url,
+                ref_name.as_deref(),
+                sha.as_deref(),
+                path.as_deref(),
+                tempdir.path(),
+            )?;
+            let path = if let Some(path) = path {
+                AbsolutePathBuf::try_from(tempdir.path().join(path)).map_err(|err| {
+                    format!("failed to resolve materialized plugin source path: {err}")
+                })?
+            } else {
+                AbsolutePathBuf::try_from(tempdir.path().to_path_buf()).map_err(|err| {
+                    format!("failed to resolve materialized plugin source path: {err}")
+                })?
+            };
+            Ok(MaterializedMarketplacePluginSource {
+                path,
+                _tempdir: Some(tempdir),
+            })
+        }
+    }
+}
+
+fn clone_git_plugin_source(
+    url: &str,
+    ref_name: Option<&str>,
+    sha: Option<&str>,
+    sparse_checkout_path: Option<&str>,
+    destination: &Path,
+) -> Result<(), String> {
+    if let Some(sparse_checkout_path) = sparse_checkout_path {
+        run_git(
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--sparse",
+                "--no-checkout",
+                url,
+                destination.to_string_lossy().as_ref(),
+            ],
+            /*cwd*/ None,
+        )?;
+        run_git(
+            &[
+                "sparse-checkout",
+                "set",
+                "--no-cone",
+                "--",
+                sparse_checkout_path,
+            ],
+            Some(destination),
+        )?;
+    } else {
+        run_git(
+            &["clone", url, destination.to_string_lossy().as_ref()],
+            /*cwd*/ None,
+        )?;
+    }
+    if let Some(target) = sha.or(ref_name) {
+        run_git(&["checkout", target], Some(destination))?;
+    } else if sparse_checkout_path.is_some() {
+        run_git(&["checkout"], Some(destination))?;
+    }
+    Ok(())
+}
+
+fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.args(args);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run git {}: {err}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "git {} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod tests;

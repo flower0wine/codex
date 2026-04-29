@@ -1,13 +1,14 @@
 use super::*;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use pretty_assertions::assert_eq;
 
 async fn process_compacted_history_with_test_session(
     compacted_history: Vec<ResponseItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
 ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
-    let (session, turn_context) = crate::codex::make_session_and_context().await;
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     session
         .set_previous_turn_settings(previous_turn_settings.cloned())
         .await;
@@ -45,6 +46,7 @@ fn content_items_to_text_joins_non_empty_segments() {
 fn content_items_to_text_ignores_image_only_content() {
     let items = vec![ContentItem::InputImage {
         image_url: "file://image.png".to_string(),
+        detail: Some(DEFAULT_IMAGE_DETAIL),
     }];
 
     let joined = content_items_to_text(&items);
@@ -61,7 +63,6 @@ fn collect_user_messages_extracts_user_text_only() {
             content: vec![ContentItem::OutputText {
                 text: "ignored".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -70,7 +71,6 @@ fn collect_user_messages_extracts_user_text_only() {
             content: vec![ContentItem::InputText {
                 text: "first".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Other,
@@ -95,7 +95,6 @@ do things
 </INSTRUCTIONS>"#
                     .to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -104,7 +103,6 @@ do things
             content: vec![ContentItem::InputText {
                 text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -113,7 +111,6 @@ do things
             content: vec![ContentItem::InputText {
                 text: "real user message".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -196,6 +193,7 @@ fn should_use_remote_compact_task_for_azure_provider() {
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -220,7 +218,6 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "stale permissions".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -229,7 +226,6 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "summary".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -238,7 +234,6 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "stale personality".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -253,7 +248,6 @@ async fn process_compacted_history_replaces_developer_messages() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -267,7 +261,6 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     }];
     let (refreshed, mut expected) = process_compacted_history_with_test_session(
@@ -281,7 +274,6 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -301,7 +293,6 @@ keep me updated
 </INSTRUCTIONS>"#
                     .to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -314,7 +305,6 @@ keep me updated
 </environment_context>"#
                     .to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -327,7 +317,6 @@ keep me updated
 </turn_aborted>"#
                     .to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -336,7 +325,6 @@ keep me updated
             content: vec![ContentItem::InputText {
                 text: "summary".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -345,7 +333,6 @@ keep me updated
             content: vec![ContentItem::InputText {
                 text: "stale developer instructions".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -360,7 +347,6 @@ keep me updated
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -375,7 +361,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -384,7 +369,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -393,7 +377,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -410,7 +393,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -419,7 +401,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -430,7 +411,6 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
         content: vec![ContentItem::InputText {
             text: "latest user".to_string(),
         }],
-        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -444,7 +424,6 @@ async fn process_compacted_history_reinjects_model_switch_message() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     }];
     let previous_turn_settings = PreviousTurnSettings {
@@ -474,7 +453,6 @@ async fn process_compacted_history_reinjects_model_switch_message() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
-        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -489,7 +467,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -498,7 +475,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -507,7 +483,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -517,7 +492,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         content: vec![ContentItem::InputText {
             text: "fresh permissions".to_string(),
         }],
-        end_turn: None,
         phase: None,
     }];
 
@@ -530,7 +504,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -539,7 +512,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "fresh permissions".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -548,7 +520,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -557,7 +528,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -575,7 +545,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         content: vec![ContentItem::InputText {
             text: "fresh permissions".to_string(),
         }],
-        end_turn: None,
         phase: None,
     }];
 
@@ -588,7 +557,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             content: vec![ContentItem::InputText {
                 text: "fresh permissions".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Compaction {
